@@ -54,7 +54,7 @@ function nl(v: string[] | undefined): string | undefined {
 // ---------------------------------------------------------------------------
 
 const server = new McpServer({
-  name: "trinket",
+  name: "cositas",
   version: "0.1.0",
 });
 
