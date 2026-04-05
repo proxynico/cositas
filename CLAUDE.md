@@ -1,50 +1,52 @@
 # cositas
 
-MCP server for Things 3 on macOS. Gives Claude Code the ability to create, update, and navigate tasks and projects in Things 3 via the [URL scheme API](https://culturedcode.com/things/support/articles/2803573/).
+MCP server for Things 3 on macOS. Full read + write access without foregrounding the app.
 
 ## Stack
 
 - Bun + TypeScript
 - `@modelcontextprotocol/sdk` (stdio transport)
-- Things 3 URL scheme (`things:///`) executed via `open` on macOS
+- JXA (JavaScript for Automation) via `osascript` — primary engine
+- NSWorkspace silent URL dispatch — fallback for JXA edge cases
 
 ## How it works
 
-Every tool builds a `things:///command?params` URL and fires it with `execFile("open", [url])`. Auth token is injected via `THINGS_AUTH_TOKEN` env var for update operations. All calls are fire-and-forget — the URL scheme doesn't return data.
+All interaction goes through `osascript -l JavaScript`. JXA talks to Things 3 via Apple Events, which never activates or foregrounds the app. Data comes back as JSON via stdout. Args are passed as `argv[0]` (JSON-serialized), avoiding string interpolation issues.
 
-## Tools (8)
+Two helpers in the JXA scope serialize items: `todoOf(t)` and `projectOf(p)`.
+
+For features JXA can't handle natively, a `things:///` URL is dispatched via `NSWorkspace.openURL` with `NSWorkspaceOpenConfiguration.activates = false` — still no foreground.
+
+## Tools (6)
 
 | Tool | What it does |
 |------|-------------|
-| `add_todo` | Create one or many to-dos (single title or bulk via `titles`) |
-| `add_project` | Create a project with optional child to-dos |
-| `update_todo` | Modify an existing to-do by ID (requires auth token) |
-| `update_project` | Modify an existing project by ID (requires auth token) |
-| `show` | Navigate to a list (`today`, `inbox`, etc.) or item by ID/name |
-| `search` | Open Things search with optional query |
-| `add_json` | Bulk/complex operations using Things 3 JSON spec |
+| `read` | Read todos from any list, project, area, or single item by ID. Returns JSON with IDs. |
+| `search` | Search open todos by name or tag. Returns JSON. |
+| `add_todo` | Create a todo (with tags, deadline, scheduling, checklist). Returns created item with ID. |
+| `add_project` | Create a project with optional child todos. Returns created item with ID. |
+| `update` | Update any item by ID: title, notes, tags, deadline, when, status, move. |
+| `show` | Navigate Things 3 UI (via quiet URL dispatch). |
 
-## Configuration
+## Architecture decisions
 
-Registered in `~/.mcp.json` as `cositas`. Auth token set in env.
-
-## Current status
-
-**v0.1.0 — write-only, not yet tested**
-
-- All write/navigate tools implemented against the full URL scheme spec
-- No read capability — the URL scheme cannot list or query existing tasks
-- Fire-and-forget execution — no confirmation of success or created IDs returned
-- Not yet tested end-to-end (need to restart Claude Code to load the MCP server)
+- **JXA over URL scheme**: URL scheme (`things:///`) always foregrounds Things 3 via `open`. JXA via Apple Events does not. JXA also returns data, which the URL scheme cannot.
+- **JXA over SQLite**: Both reference implementations (things-api, Things3-MCP) use direct SQLite reads. JXA is slower for bulk reads but doesn't depend on database file paths, works for both reads and writes, and won't break if Things changes its schema.
+- **Area read via project filter**: JXA's `area.projects()` throws "Can't get object" (JXA limitation). We filter all projects by area name with substring matching instead. This also handles emoji-prefixed area names (e.g., searching "LP Global" matches "LP Global").
+- **Status changes in JXA**: `item.status = "completed"` works in JXA despite status being an AppleScript enum. Tested on macOS 15 (Sequoia).
+- **quietUrl for show**: JXA's `app.show()` activates the app window. `quietUrl` dispatches via NSWorkspace with `activates=false`.
+- **quietUrl for when=someday/anytime/evening**: JXA's `schedule` command only takes dates. These special values require the URL scheme.
+- **Checklist items via URL scheme**: JXA can't create checklist items on new todos. Created via quietUrl post-create patch using `append-checklist-items`.
 
 ## Known limitations
 
-- **No reads.** Can't list todos, projects, areas, or tags. The URL scheme is write/navigate only. To add reads, we'd need AppleScript (JXA via `osascript`) or direct SQLite access to the Things database.
-- **No return values.** `open` doesn't capture x-callback-url responses, so we don't get back created item IDs. Updates require knowing the ID upfront.
-- **macOS only.** Uses `open` to dispatch URL schemes.
+- **Tag names with commas**: Things 3's `tagNames` property is comma-separated. Tags containing commas will be split incorrectly. No workaround without using a different API to set tags individually.
+- **`when` cannot be cleared**: Neither JXA nor URL scheme support removing activation dates (un-scheduling a todo). Would require direct SQLite writes.
+- **Logbook can be very large**: `read(list: "logbook")` returns all completed items. No date-range or limit parameter yet.
+- **macOS only**: Uses `osascript` and Things 3 Apple Events.
+- **No delete**: Todos can be canceled (`update` with `canceled: true`) but not permanently deleted (moved to Trash).
+- **No bulk update/complete**: Updates are one-at-a-time by ID. Bulk operations require multiple calls.
 
-## Next steps
+## Configuration
 
-- [ ] Test all tools end-to-end
-- [ ] Add read capability (AppleScript or SQLite) for listing todos/projects/areas/tags
-- [ ] Consider capturing x-callback-url responses for created IDs
+Registered in `~/.mcp.json` as `cositas`. Auth token set via `THINGS_AUTH_TOKEN` env var (needed for quietUrl fallback operations only).
