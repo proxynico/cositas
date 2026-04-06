@@ -45,7 +45,6 @@ const updateDeadlineSchema = z
 
 export type ExecResult = {
   stdout: string;
-  stderr?: string;
 };
 
 export type ExecFn = (file: string, args: string[]) => Promise<ExecResult>;
@@ -383,7 +382,7 @@ delay(0.5);`,
             if (byStop !== 0) return byStop;
           }
 
-          if ((l?.userModificationDate ?? null) != null || (r?.userModificationDate ?? null) != null) {
+          if (l?.userModificationDate != null || r?.userModificationDate != null) {
             const byModified = compareNullableNumber(-(l?.userModificationDate ?? 0), -(r?.userModificationDate ?? 0));
             if (byModified !== 0) return byModified;
           }
@@ -1032,10 +1031,7 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
     {},
     async () => {
       try {
-        await runtime.jxa(
-          `app.emptyTrash();
-return JSON.stringify({emptied: true});`,
-        );
+        await runtime.jxa(`app.emptyTrash();`);
         return ok('{"emptied":true}');
       } catch (error) {
         return fail(errmsg(error));
