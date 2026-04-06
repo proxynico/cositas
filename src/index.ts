@@ -593,7 +593,6 @@ export function createServer(runtime = createRuntime()): {
 
 /* v8 ignore next 4 */
 if (import.meta.main) {
-  await verifyThingsAccess(createRuntime());
   const transport = new StdioServerTransport();
   const { server } = createServer();
   await server.connect(transport);

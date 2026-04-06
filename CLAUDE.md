@@ -17,7 +17,7 @@ Two helpers in the JXA scope serialize items: `todoOf(t)` and `projectOf(p)`.
 
 For features JXA can't handle natively, a `things:///` URL is dispatched via `NSWorkspace.openURL` with `NSWorkspaceOpenConfiguration.activates = false` — still no foreground.
 
-On startup, the server runs a read-only Things access probe before connecting stdio. If Apple Events are blocked by a sandboxed `osascript` environment, startup fails immediately with a clear diagnostic instead of returning opaque `Connection Invalid` / `-1701` failures later.
+Things 3 is only contacted when a tool is actually called — the server starts without touching the app. If Apple Events are blocked by a sandboxed `osascript` environment, individual tool calls will return clear error messages.
 
 ## Tools (6)
 
