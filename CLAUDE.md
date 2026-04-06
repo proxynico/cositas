@@ -17,6 +17,8 @@ Two helpers in the JXA scope serialize items: `todoOf(t)` and `projectOf(p)`.
 
 For features JXA can't handle natively, a `things:///` URL is dispatched via `NSWorkspace.openURL` with `NSWorkspaceOpenConfiguration.activates = false` — still no foreground.
 
+On startup, the server runs a read-only Things access probe before connecting stdio. If Apple Events are blocked by a sandboxed `osascript` environment, startup fails immediately with a clear diagnostic instead of returning opaque `Connection Invalid` / `-1701` failures later.
+
 ## Tools (6)
 
 | Tool | What it does |
@@ -32,11 +34,14 @@ For features JXA can't handle natively, a `things:///` URL is dispatched via `NS
 
 - **JXA over URL scheme**: URL scheme (`things:///`) always foregrounds Things 3 via `open`. JXA via Apple Events does not. JXA also returns data, which the URL scheme cannot.
 - **JXA over SQLite**: Both reference implementations (things-api, Things3-MCP) use direct SQLite reads. JXA is slower for bulk reads but doesn't depend on database file paths, works for both reads and writes, and won't break if Things changes its schema.
-- **Area read via project filter**: JXA's `area.projects()` throws "Can't get object" (JXA limitation). We filter all projects by area name with substring matching instead. This also handles emoji-prefixed area names (e.g., searching "LP Global" matches "LP Global").
+- **Exact area reads via project filter**: JXA's `area.projects()` throws "Can't get object" (JXA limitation). We filter all projects and keep exact `p.area().name() === target` matches instead. This avoids ambiguous substring matches such as `Work` vs `Work Admin`.
 - **Status changes in JXA**: `item.status = "completed"` works in JXA despite status being an AppleScript enum. Tested on macOS 15 (Sequoia).
 - **quietUrl for show**: JXA's `app.show()` activates the app window. `quietUrl` dispatches via NSWorkspace with `activates=false`.
 - **quietUrl for when=someday/anytime/evening**: JXA's `schedule` command only takes dates. These special values require the URL scheme.
 - **Checklist items via URL scheme**: JXA can't create checklist items on new todos. Created via quietUrl post-create patch using `append-checklist-items`.
+- **Path-based app binding**: JXA now targets `THINGS_APP_PATH` and defaults to `/Applications/Things3.app`. Name-based resolution (`Application("Things3")`) was not reliable in this environment.
+- **Fail-fast fallback auth**: URL-scheme-only operations now require `THINGS_AUTH_TOKEN` before mutating anything, so the server does not partially create/update items and only then discover it cannot finish the operation.
+- **Final-state returns after fallback writes**: Mutations that need quiet URL patches re-read the item afterward and return the final state rather than the pre-patch JXA snapshot.
 
 ## Known limitations
 
@@ -44,9 +49,21 @@ For features JXA can't handle natively, a `things:///` URL is dispatched via `NS
 - **`when` cannot be cleared**: Neither JXA nor URL scheme support removing activation dates (un-scheduling a todo). Would require direct SQLite writes.
 - **Logbook can be very large**: `read(list: "logbook")` returns all completed items. No date-range or limit parameter yet.
 - **macOS only**: Uses `osascript` and Things 3 Apple Events.
+- **Codex sandbox cannot run live Things automation**: inside this environment, sandboxed `osascript` is denied `mach-lookup` to `com.apple.hiservices-xpcservice`. Live Things reads and writes work only outside that sandbox.
 - **No delete**: Todos can be canceled (`update` with `canceled: true`) but not permanently deleted (moved to Trash).
 - **No bulk update/complete**: Updates are one-at-a-time by ID. Bulk operations require multiple calls.
 
 ## Configuration
 
-Registered in `~/.mcp.json` as `cositas`. Auth token set via `THINGS_AUTH_TOKEN` env var (needed for quietUrl fallback operations only).
+Registered in `~/.mcp.json` as `cositas`.
+
+- `THINGS_AUTH_TOKEN`: required for URL-scheme fallback operations only (`when=anytime|someday|evening`, checklist item patches).
+- `THINGS_APP_PATH`: optional override for the Things app bundle path. Defaults to `/Applications/Things3.app`.
+
+## Development
+
+- `bun test`: run the mocked handler/unit suite.
+- `bun test --coverage`: run the suite with coverage.
+- `bun build src/index.ts --target bun --outdir /tmp/cositas-audit`: compile-check the runtime entrypoint.
+
+The automated suite fully covers the server logic, but it does not run live write operations against a real Things database.
