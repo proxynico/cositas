@@ -1,40 +1,41 @@
 # cositas
 
-MCP server for [Things 3](https://culturedcode.com/things/) on macOS. Full read and write access to your tasks without ever foregrounding the app.
+MCP server for [Things 3](https://culturedcode.com/things/) on macOS.
 
-Built for AI assistants (Claude, GPT, etc.) that support the [Model Context Protocol](https://modelcontextprotocol.io). Your assistant can read your task list, create todos, update projects, and navigate the app -- all in the background.
+It gives an AI assistant background read/write access to Things without foregrounding the app. Reads come back as JSON, writes return IDs, and the server stays close to Things' supported automation surface instead of doing direct database writes.
 
-## Why
+## Why it exists
 
-Things 3 has no official API. The two common workarounds each have problems:
+Things has no public API.
 
-- **URL scheme** (`things:///`): Always foregrounds the app. Cannot return data.
-- **Direct SQLite**: Read-only. Breaks when Things changes its schema. Depends on finding the database file.
+- `things:///` is good for commands, but not for reading data.
+- Direct SQLite is fast, but brittle for writes.
 
-cositas uses **JXA** (JavaScript for Automation) via Apple Events. This gives full read/write access, returns structured data, and never activates the Things window. For the few operations JXA can't handle (scheduling to someday/anytime/evening, checklist items), it falls back to URL scheme dispatch via `NSWorkspace` with `activates = false` -- still no foreground.
+`cositas` uses JXA via `osascript` for the main interface, then uses Things' URL / JSON commands only for the write cases JXA does not cover well.
 
-## Tools
+## What it can do
 
-| Tool | Description |
-|------|-------------|
-| `read` | Read todos from any list, project, area, or by ID. Returns JSON with full details. |
-| `search` | Search open todos by name or tag. |
-| `add_todo` | Create a todo with tags, deadline, scheduling, checklist items, and project assignment. |
-| `add_project` | Create a project with optional child todos. |
-| `update` | Update any item by ID: title, notes, tags, deadline, scheduling, status, move between projects/areas. |
-| `show` | Navigate the Things 3 UI to any list, project, area, or item (background URL dispatch). |
+- `read`: read a built-in list, project, area, or item by ID
+- `search`: search open todos by name or tag
+- `add_todo`: create todos with notes, deadlines, tags, list placement, and checklist items
+- `add_project`: create projects with notes, deadlines, tags, area placement, and child todos
+- `update`: update one item by ID
+- `bulk_update`: update many items in one call
+- `delete`: move a todo, project, or area to Trash
+- `empty_trash`: permanently clear Trash
+- `show`: navigate Things in the background
 
-All tools return JSON with item IDs, so your assistant can chain operations (create a todo, then update it, then move it).
+Built-in list reads can include both todos and projects. Mixed ordering uses local DB sort keys when available. All tool responses are JSON.
 
 ## Setup
 
-### Requirements
+Requirements:
 
-- macOS (uses `osascript` and Apple Events)
+- macOS
 - [Things 3](https://culturedcode.com/things/)
 - [Bun](https://bun.sh)
 
-### Install
+Install:
 
 ```bash
 git clone https://github.com/proxynico/cositas.git
@@ -42,9 +43,7 @@ cd cositas
 bun install
 ```
 
-### Register as an MCP server
-
-Add to your MCP client config (e.g. `~/.mcp.json` for Claude Code, or your client's MCP settings):
+Register it in your MCP client:
 
 ```json
 {
@@ -60,74 +59,49 @@ Add to your MCP client config (e.g. `~/.mcp.json` for Claude Code, or your clien
 }
 ```
 
-### Environment variables
+Environment:
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `THINGS_AUTH_TOKEN` | For some operations | Auth token from Things 3 settings. Needed for URL-scheme fallback operations: scheduling to `anytime`, `someday`, or `evening`, and adding checklist items. |
-| `THINGS_APP_PATH` | No | Override the Things app bundle path. Defaults to `/Applications/Things3.app`. |
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `THINGS_AUTH_TOKEN` | Sometimes | Needed for JSON / URL updates: bulk updates, special `when` values, clearing `when`, checklist writes, and comma-containing tag writes |
+| `THINGS_APP_PATH` | No | Override the Things app path. Default: `/Applications/Things3.app` |
+| `THINGS_FAST_READS` | No | Set to `0` to disable the SQLite fast path for large `logbook` / `trash` reads |
+| `THINGS_DB_PATH` | No | Override the detected Things SQLite path for fast reads |
 
-To get your auth token: Things 3 > Settings > General > Enable Things URLs > copy the token.
+Get the auth token from Things: `Settings -> General -> Enable Things URLs`.
 
 ## How it works
 
-```
-MCP Client (Claude, etc.)
-    |
-    | stdio (JSON-RPC)
-    v
-cositas (Bun + TypeScript)
-    |
-    |-- JXA via osascript (primary engine)
-    |   Uses Apple Events to talk to Things 3.
-    |   Never foregrounds the app.
-    |   Returns JSON via stdout.
-    |
-    |-- NSWorkspace URL dispatch (fallback)
-        For operations JXA can't handle natively.
-        Dispatches things:// URLs with activates=false.
-        Used for: someday/anytime/evening scheduling,
-        checklist items, UI navigation.
-```
+- JXA via `osascript` is the primary read/write path.
+- Things URL / JSON commands handle complex writes like bulk updates, checklist writes, and special `when` values.
+- Large `logbook` and `trash` reads can use a narrow SQLite fast path for paging/filtering IDs, then hydrate the final item details through Things automation.
 
-Arguments are passed to JXA as `argv[0]` (JSON-serialized), avoiding string interpolation and injection issues.
+Arguments are passed into JXA as JSON, not string-interpolated script fragments.
 
-## Usage examples
+## Examples
 
-Once registered, your AI assistant can do things like:
-
-**Read your today list:**
-> "What's on my Things today list?"
-
-**Create a todo with a deadline:**
-> "Add a todo 'Review Q2 budget' with deadline 2026-04-15 in my Finance project"
-
-**Search by tag:**
-> "Find all todos tagged 'urgent'"
-
-**Update a todo:**
-> "Mark that todo as completed" / "Move it to the Someday list"
-
-**Create a project with child todos:**
-> "Create a project 'Website Redesign' with todos: wireframes, design review, implementation"
+- "What's on my Today list?"
+- "Find all open todos tagged urgent"
+- "Create a todo Review Q2 budget with deadline 2026-04-15 in Finance"
+- "Move this item to Someday"
+- "Bulk-complete these IDs"
+- "Show the Launch project"
 
 ## Development
 
 ```bash
-bun test              # run test suite
-bun test --coverage   # with coverage
+bun test
+bun test --coverage
 ```
 
-The test suite mocks the JXA runtime and covers all tool handlers. It does not run live operations against a real Things database.
+The test suite mocks the runtime. It does not execute live writes against a real Things database.
 
-## Known limitations
+## Limitations
 
-- **macOS only** -- relies on `osascript` and Apple Events
-- **No delete** -- todos can be canceled but not moved to Trash (Things API limitation)
-- **No bulk operations** -- updates are one-at-a-time by ID
-- **Tag commas** -- tags containing commas will be split incorrectly (Things uses comma-separated `tagNames`)
-- **`when` cannot be cleared** -- neither JXA nor URL scheme support removing activation dates
-- **Large logbooks** -- `read(list: "logbook")` returns all completed items with no pagination
+- macOS only
+- Bulk updates still require `THINGS_AUTH_TOKEN`
+- `logbook` / `trash` are faster now, but final item hydration still goes through Things automation
+- Mixed built-in list ordering still depends on Things internals, especially for `upcoming`
 
 ## License
 

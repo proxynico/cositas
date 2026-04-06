@@ -7,6 +7,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { Database } from "bun:sqlite";
 
 const exec = promisify(execFile);
 
@@ -14,11 +18,19 @@ const BUILTIN_WHEN = ["today", "tomorrow", "evening", "anytime", "someday"] as c
 const SPECIAL_WHEN = new Set<string>(["evening", "anytime", "someday"]);
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const THINGS_APP_PATH = process.env.THINGS_APP_PATH ?? "/Applications/Things3.app";
+const THINGS_FAST_READS = process.env.THINGS_FAST_READS !== "0";
+const THINGS_DB_PATH = process.env.THINGS_DB_PATH;
 
 const whenSchema = z
   .string()
   .refine((value) => BUILTIN_WHEN.includes(value as (typeof BUILTIN_WHEN)[number]) || ISO_DATE.test(value), {
     message: "Use today, tomorrow, evening, anytime, someday, or yyyy-mm-dd",
+  });
+
+const updateWhenSchema = z
+  .string()
+  .refine((value) => value === "" || BUILTIN_WHEN.includes(value as (typeof BUILTIN_WHEN)[number]) || ISO_DATE.test(value), {
+    message: "Use today, tomorrow, evening, anytime, someday, yyyy-mm-dd, or empty string",
   });
 
 const deadlineSchema = z
@@ -41,6 +53,17 @@ export type ExecFn = (file: string, args: string[]) => Promise<ExecResult>;
 export type ThingsRuntime = {
   jxa(body: string, args?: Record<string, unknown>): Promise<string>;
   quietUrl(path: string, params: Record<string, string | undefined>): Promise<void>;
+  quietJson(operations: Array<Record<string, unknown>>, reveal?: boolean): Promise<void>;
+  fastListRead(
+    list: string,
+    options?: {
+      limit?: number;
+      offset?: number;
+      completed_after?: string;
+      completed_before?: string;
+    },
+  ): Promise<string | null>;
+  sortListItems(list: string, items: Array<Record<string, unknown>>): Array<Record<string, unknown>>;
   token: string;
 };
 
@@ -64,6 +87,7 @@ export const LIST_NAMES: Record<string, string> = {
   upcoming: "Upcoming",
   someday: "Someday",
   logbook: "Logbook",
+  trash: "Trash",
 };
 
 export const errmsg = (error: unknown): string => {
@@ -82,6 +106,34 @@ export const isSandboxAutomationError = (error: unknown): boolean => {
   return SANDBOX_FAILURE_MARKERS.some((marker) => message.includes(marker));
 };
 
+function discoverThingsDbPath(): string | null {
+  if (THINGS_DB_PATH) {
+    return existsSync(THINGS_DB_PATH) ? THINGS_DB_PATH : null;
+  }
+  const root = join(homedir(), "Library", "Group Containers", "JLMPQHK86H.com.culturedcode.ThingsMac");
+  if (!existsSync(root)) return null;
+  const dataDir = readdirSync(root, { withFileTypes: true })
+    .find((entry) => entry.isDirectory() && entry.name.startsWith("ThingsData-"))
+    ?.name;
+  if (!dataDir) return null;
+  const candidate = join(root, dataDir, "Things Database.thingsdatabase", "main.sqlite");
+  return existsSync(candidate) ? candidate : null;
+}
+
+function isoDayToUnixStart(value: string): number {
+  return Math.floor(new Date(`${value}T00:00:00Z`).getTime() / 1000);
+}
+
+function isoDayToUnixEnd(value: string): number {
+  return Math.floor(new Date(`${value}T23:59:59Z`).getTime() / 1000);
+}
+
+function compareNullableNumber(a: number | null | undefined, b: number | null | undefined): number {
+  const av = a ?? Number.MAX_SAFE_INTEGER;
+  const bv = b ?? Number.MAX_SAFE_INTEGER;
+  return av - bv;
+}
+
 export function createRuntime({
   execFn = exec,
   token = process.env.THINGS_AUTH_TOKEN ?? "",
@@ -89,6 +141,7 @@ export function createRuntime({
   execFn?: ExecFn;
   token?: string;
 } = {}): ThingsRuntime {
+  let dbPath: string | null | undefined;
   return {
     token,
     async jxa(body, args = {}) {
@@ -99,20 +152,62 @@ export function createRuntime({
         `function run(argv) {
 var P = JSON.parse(argv[0]);
 var app = Application(${JSON.stringify(THINGS_APP_PATH)});
+var tagsOf = function(item) {
+  try {
+    return item.tags().map(function(tag) { return tag.name(); });
+  } catch(e) {
+    var raw = "";
+    try { raw = item.tagNames(); } catch(inner) {}
+    if (!raw) return [];
+    return raw.split(/,\s*/);
+  }
+};
+var asIso = function(d) {
+  return d ? d.toISOString() : null;
+};
+var completedAtOf = function(item) {
+  try {
+    var done = item.completionDate();
+    if (done) return done;
+  } catch(e) {}
+  try {
+    var canceled = item.cancellationDate();
+    if (canceled) return canceled;
+  } catch(e) {}
+  return null;
+};
+var applyReadWindow = function(items) {
+  var filtered = items;
+  if (P.completedAfter || P.completedBefore) {
+    filtered = filtered.filter(function(item) {
+      var stamp = completedAtOf(item);
+      if (!stamp) return false;
+      if (P.completedAfter && stamp < new Date(P.completedAfter + "T00:00:00")) return false;
+      if (P.completedBefore && stamp > new Date(P.completedBefore + "T23:59:59")) return false;
+      return true;
+    });
+  }
+  var start = P.offset || 0;
+  if (P.limit == null) return filtered.slice(start);
+  return filtered.slice(start, start + P.limit);
+};
 var todoOf = function(t) {
   var proj = null, area = null;
   try { proj = t.project().name(); } catch(e) {}
   try { area = t.area().name(); } catch(e) {}
-  return {id:t.id(), name:t.name(), status:t.status(), notes:t.notes(),
-    tags:t.tagNames(), dueDate:t.dueDate()?t.dueDate().toISOString():null,
-    activationDate:t.activationDate()?t.activationDate().toISOString():null,
+  return {kind:"todo", id:t.id(), name:t.name(), status:t.status(), notes:t.notes(),
+    tags:tagsOf(t), dueDate:asIso(t.dueDate()),
+    activationDate:asIso(t.activationDate()), completionDate:asIso(t.completionDate()),
+    cancellationDate:asIso(t.cancellationDate()),
     project:proj, area:area};
 };
 var projectOf = function(pr) {
   var area = null;
   try { area = pr.area().name(); } catch(e) {}
-  return {id:pr.id(), name:pr.name(), status:pr.status(), notes:pr.notes(),
-    tags:pr.tagNames(), dueDate:pr.dueDate()?pr.dueDate().toISOString():null,
+  return {kind:"project", id:pr.id(), name:pr.name(), status:pr.status(), notes:pr.notes(),
+    tags:tagsOf(pr), dueDate:asIso(pr.dueDate()),
+    activationDate:asIso(pr.activationDate()), completionDate:asIso(pr.completionDate()),
+    cancellationDate:asIso(pr.cancellationDate()),
     area:area, todoCount:pr.toDos().length};
 };
 ${body}
@@ -139,6 +234,165 @@ c.activates = false;
 $.NSWorkspace.sharedWorkspace.openURLConfigurationCompletionHandler(u, c, null);
 delay(0.5);`,
       ]);
+    },
+
+    async quietJson(operations, reveal = false) {
+      const requiresAuth = operations.some((operation) => operation.operation === "update");
+      if (requiresAuth) {
+        requireToken(token);
+      }
+      await this.quietUrl("json", {
+        "auth-token": requiresAuth ? token : undefined,
+        reveal: reveal ? "true" : "false",
+        data: JSON.stringify(operations),
+      });
+    },
+
+    async fastListRead(list, options = {}) {
+      if (!THINGS_FAST_READS || (list !== "logbook" && list !== "trash")) {
+        return null;
+      }
+
+      if (dbPath === undefined) {
+        dbPath = discoverThingsDbPath();
+      }
+      if (!dbPath) {
+        return null;
+      }
+
+      const db = new Database(dbPath, { readonly: true, create: false });
+      try {
+        const where: string[] = [`type in (0, 1)`];
+        const params: Array<string | number> = [];
+        let orderBy = "userModificationDate desc";
+
+        if (list === "logbook") {
+          where.push("trashed = 0");
+          where.push("status in (2, 3)");
+          orderBy = "stopDate desc, userModificationDate desc";
+        } else if (list === "trash") {
+          where.push("trashed = 1");
+        }
+
+        if (options.completed_after) {
+          where.push("stopDate >= ?");
+          params.push(isoDayToUnixStart(options.completed_after));
+        }
+        if (options.completed_before) {
+          where.push("stopDate <= ?");
+          params.push(isoDayToUnixEnd(options.completed_before));
+        }
+
+        let sql = `
+          select uuid as id
+          from TMTask
+          where ${where.join(" and ")}
+          order by ${orderBy}
+        `;
+
+        if (options.limit != null) {
+          sql += ` limit ? offset ?`;
+          params.push(options.limit, options.offset ?? 0);
+        } else if ((options.offset ?? 0) > 0) {
+          sql += ` limit -1 offset ?`;
+          params.push(options.offset ?? 0);
+        }
+
+        const rows = db.query(sql).all(...params) as Array<{ id: string }>;
+        if (!rows.length) {
+          return "[]";
+        }
+
+        return await this.jxa(
+          `return JSON.stringify(P.ids.map(function(id) {
+  try {
+    var todo = app.toDos.byId(id); todo.id();
+    return todoOf(todo);
+  } catch(e) {
+    var project = app.projects.byId(id); project.id();
+    return projectOf(project);
+  }
+}));`,
+          { ids: rows.map((row) => row.id) },
+        );
+      } finally {
+        db.close(false);
+      }
+    },
+
+    sortListItems(list, items) {
+      if (!items.length) return items;
+
+      if (dbPath === undefined) {
+        dbPath = discoverThingsDbPath();
+      }
+      if (!dbPath) {
+        return items;
+      }
+
+      const ids = items
+        .map((item) => String(item.id ?? ""))
+        .filter((id) => id.length > 0);
+      if (!ids.length) {
+        return items;
+      }
+
+      const placeholders = ids.map(() => "?").join(", ");
+      const db = new Database(dbPath, { readonly: true, create: false });
+      try {
+        const rows = db
+          .query(
+            `select uuid as id, "index" as idx, todayIndex, startDate, deadline, stopDate, userModificationDate
+             from TMTask
+             where uuid in (${placeholders})`,
+          )
+          .all(...ids) as Array<{
+          id: string;
+          idx: number | null;
+          todayIndex: number | null;
+          startDate: number | null;
+          deadline: number | null;
+          stopDate: number | null;
+          userModificationDate: number | null;
+        }>;
+
+        const meta = new Map(rows.map((row) => [row.id, row]));
+        const original = new Map(items.map((item, index) => [String(item.id ?? index), index]));
+
+        return [...items].sort((left, right) => {
+          const l = meta.get(String(left.id ?? ""));
+          const r = meta.get(String(right.id ?? ""));
+
+          if (list === "today") {
+            const byToday = compareNullableNumber(l?.todayIndex, r?.todayIndex);
+            if (byToday !== 0) return byToday;
+          }
+
+          if (list === "upcoming") {
+            const byStart = compareNullableNumber(l?.startDate, r?.startDate);
+            if (byStart !== 0) return byStart;
+            const byDeadline = compareNullableNumber(l?.deadline, r?.deadline);
+            if (byDeadline !== 0) return byDeadline;
+          }
+
+          const byIndex = compareNullableNumber(l?.idx, r?.idx);
+          if (byIndex !== 0) return byIndex;
+
+          if (list === "logbook" || list === "trash") {
+            const byStop = compareNullableNumber(-(l?.stopDate ?? 0), -(r?.stopDate ?? 0));
+            if (byStop !== 0) return byStop;
+          }
+
+          if ((l?.userModificationDate ?? null) != null || (r?.userModificationDate ?? null) != null) {
+            const byModified = compareNullableNumber(-(l?.userModificationDate ?? 0), -(r?.userModificationDate ?? 0));
+            if (byModified !== 0) return byModified;
+          }
+
+          return (original.get(String(left.id ?? "")) ?? 0) - (original.get(String(right.id ?? "")) ?? 0);
+        });
+      } finally {
+        db.close(false);
+      }
     },
   };
 }
@@ -174,13 +428,67 @@ async function readItemJson(runtime: ThingsRuntime, id: string): Promise<string>
   );
 }
 
-async function applyQuietWhen(runtime: ThingsRuntime, kind: "todo" | "project", id: string, when: string): Promise<void> {
+async function applyQuietUpdate(
+  runtime: ThingsRuntime,
+  kind: "todo" | "project",
+  id: string,
+  params: Record<string, string | undefined>,
+): Promise<void> {
   requireToken(runtime.token);
   await runtime.quietUrl(kind === "project" ? "update-project" : "update", {
     "auth-token": runtime.token,
     id,
-    when,
+    ...params,
   });
+}
+
+function needsJsonTagWrite(tags: string[] | undefined): boolean {
+  return Boolean(tags?.some((tag) => tag.includes(",")));
+}
+
+function toChecklistItems(items: string[] | undefined): Array<Record<string, unknown>> | undefined {
+  if (!items?.length) return undefined;
+  return items.map((title) => ({
+    type: "checklist-item",
+    attributes: { title },
+  }));
+}
+
+function buildJsonUpdateOperation(
+  kind: "todo" | "project",
+  id: string,
+  params: {
+    title?: string;
+    notes?: string;
+    when?: string;
+    deadline?: string;
+    tags?: string[];
+    list?: string;
+    completed?: boolean;
+    canceled?: boolean;
+    checklist_items?: string[];
+  },
+): Record<string, unknown> | null {
+  const attributes: Record<string, unknown> = {};
+  if (params.title != null) attributes.title = params.title;
+  if (params.notes != null) attributes.notes = params.notes;
+  if (params.when != null && params.when !== "") attributes.when = params.when;
+  if (params.deadline != null && params.deadline !== "") attributes.deadline = params.deadline;
+  if (params.tags != null) attributes.tags = params.tags;
+  if (params.completed != null) attributes.completed = params.completed;
+  if (params.canceled != null) attributes.canceled = params.canceled;
+  if (kind === "todo" && params.list != null) attributes.list = params.list;
+  if (kind === "project" && params.list != null) attributes.area = params.list;
+  if (kind === "todo" && params.checklist_items != null) {
+    attributes["checklist-items"] = toChecklistItems(params.checklist_items);
+  }
+  if (!Object.keys(attributes).length) return null;
+  return {
+    type: kind === "todo" ? "to-do" : "project",
+    operation: "update",
+    id,
+    attributes,
+  };
 }
 
 export async function verifyThingsAccess(runtime: ThingsRuntime): Promise<void> {
@@ -215,6 +523,7 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
           "upcoming",
           "someday",
           "logbook",
+          "trash",
           "projects",
           "areas",
           "tags",
@@ -233,8 +542,12 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
         .string()
         .optional()
         .describe("Todo or project ID — returns full detail with checklist/child todos"),
+      limit: z.number().int().nonnegative().optional().describe("Max items to return"),
+      offset: z.number().int().nonnegative().optional().describe("Items to skip before returning results"),
+      completed_after: deadlineSchema.optional().describe("Only return items completed/canceled on or after yyyy-mm-dd"),
+      completed_before: deadlineSchema.optional().describe("Only return items completed/canceled on or before yyyy-mm-dd"),
     },
-    async ({ list, project, area, id }) => {
+    async ({ list, project, area, id, limit, offset, completed_after, completed_before }) => {
       const selectors = [list, project, area, id].filter((value) => value != null);
       if (selectors.length !== 1) {
         return fail("Provide exactly one of list, project, area, or id");
@@ -279,8 +592,14 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
           return ok(
             await runtime.jxa(
               `var p = app.projects.byName(P.n); p.id();
-return JSON.stringify(p.toDos().map(todoOf));`,
-              { n: project },
+return JSON.stringify(applyReadWindow(p.toDos()).map(todoOf));`,
+              {
+                n: project,
+                limit: limit ?? null,
+                offset: offset ?? 0,
+                completedAfter: completed_after ?? null,
+                completedBefore: completed_before ?? null,
+              },
             ),
           );
         }
@@ -300,12 +619,45 @@ return JSON.stringify(projs.map(projectOf));`,
           );
         }
 
-        return ok(
-          await runtime.jxa(
-            `return JSON.stringify(app.lists.byName(P.n).toDos().map(todoOf));`,
-            { n: LIST_NAMES[list!] },
-          ),
+        const fast = await runtime.fastListRead(list!, {
+          limit,
+          offset,
+          completed_after,
+          completed_before,
+        });
+        if (fast != null) {
+          return ok(fast);
+        }
+
+        const mixed = await runtime.jxa(
+          `var list = app.lists.byName(P.n);
+var todos = list.toDos().map(todoOf);
+var projects = [];
+try { projects = list.projects().map(projectOf); } catch(e) {}
+var items = todos.concat(projects);
+if (P.completedAfter || P.completedBefore) {
+  items = items.filter(function(item) {
+    var stamp = item.completionDate || item.cancellationDate;
+    if (!stamp) return false;
+    var value = new Date(stamp);
+    if (P.completedAfter && value < new Date(P.completedAfter + "T00:00:00")) return false;
+    if (P.completedBefore && value > new Date(P.completedBefore + "T23:59:59")) return false;
+    return true;
+  });
+}
+var start = P.offset || 0;
+if (P.limit != null) items = items.slice(start, start + P.limit);
+else if (start) items = items.slice(start);
+return JSON.stringify(items);`,
+          {
+            n: LIST_NAMES[list!],
+            limit: limit ?? null,
+            offset: offset ?? 0,
+            completedAfter: completed_after ?? null,
+            completedBefore: completed_before ?? null,
+          },
         );
+        return ok(JSON.stringify(runtime.sortListItems(list!, JSON.parse(mixed) as Array<Record<string, unknown>>)));
       } catch (error) {
         return fail(errmsg(error));
       }
@@ -324,11 +676,17 @@ return JSON.stringify(projs.map(projectOf));`,
       try {
         return ok(
           await runtime.jxa(
-            `var f = {};
-if (P.q) f.name = {_contains: P.q};
-if (P.t) f.tagNames = {_contains: P.t};
-var results = app.toDos.whose(f)();
+            `var results = P.q ? app.toDos.whose({name: {_contains: P.q}})() : app.toDos();
 results = results.filter(function(t) { return t.status() === "open"; });
+if (P.t) {
+  results = results.filter(function(t) {
+    try {
+      return t.tags().some(function(tag) { return tag.name() === P.t; });
+    } catch(e) {
+      return false;
+    }
+  });
+}
 return JSON.stringify(results.map(todoOf));`,
             { q: query ?? null, t: tag ?? null },
           ),
@@ -355,14 +713,17 @@ return JSON.stringify(results.map(todoOf));`,
     },
     async (params) => {
       try {
-        if (usesSpecialWhen(params.when) || params.checklist_items?.length) {
+        const specialWhen = usesSpecialWhen(params.when) ? params.when : undefined;
+        const tagsNeedJson = needsJsonTagWrite(params.tags);
+        const needsJsonPatch = specialWhen != null || params.checklist_items?.length || tagsNeedJson;
+        if (needsJsonPatch) {
           requireToken(runtime.token);
         }
 
         const result = await runtime.jxa(
           `var props = {name: P.title};
 if (P.notes) props.notes = P.notes;
-if (P.tags && P.tags.length) props.tagNames = P.tags.join(", ");
+if (P.tags && P.tags.length && !P.tagsNeedJson) props.tagNames = P.tags.join(", ");
 if (P.deadline) props.dueDate = new Date(P.deadline + "T12:00:00");
 var todo = app.make({new: "toDo", withProperties: props});
 if (P.list) {
@@ -381,23 +742,20 @@ if (P.when) {
   }
 }
 return JSON.stringify({id: todo.id(), name: todo.name(), status: todo.status()});`,
-          params,
+          {
+            ...params,
+            tagsNeedJson,
+          },
         );
 
         const created = JSON.parse(result) as { id: string };
-        const patches: Record<string, string | undefined> = {};
-        if (usesSpecialWhen(params.when)) {
-          patches.when = params.when;
-        }
-        if (params.checklist_items?.length) {
-          patches["append-checklist-items"] = params.checklist_items.join("\n");
-        }
-        if (Object.keys(patches).length) {
-          await runtime.quietUrl("update", {
-            "auth-token": runtime.token,
-            id: created.id,
-            ...patches,
-          });
+        const operation = buildJsonUpdateOperation("todo", created.id, {
+          when: specialWhen,
+          tags: tagsNeedJson ? params.tags : undefined,
+          checklist_items: params.checklist_items,
+        });
+        if (operation) {
+          await runtime.quietJson([operation]);
           return ok(await readItemJson(runtime, created.id));
         }
 
@@ -424,14 +782,17 @@ return JSON.stringify({id: todo.id(), name: todo.name(), status: todo.status()})
     },
     async (params) => {
       try {
-        if (usesSpecialWhen(params.when)) {
+        const specialWhen = usesSpecialWhen(params.when) ? params.when : undefined;
+        const tagsNeedJson = needsJsonTagWrite(params.tags);
+        const needsJsonPatch = specialWhen != null || tagsNeedJson;
+        if (needsJsonPatch) {
           requireToken(runtime.token);
         }
 
         const result = await runtime.jxa(
           `var props = {name: P.title};
 if (P.notes) props.notes = P.notes;
-if (P.tags && P.tags.length) props.tagNames = P.tags.join(", ");
+if (P.tags && P.tags.length && !P.tagsNeedJson) props.tagNames = P.tags.join(", ");
 if (P.deadline) props.dueDate = new Date(P.deadline + "T12:00:00");
 var proj = app.make({new: "project", withProperties: props});
 if (P.area) {
@@ -456,12 +817,19 @@ if (P.when) {
   }
 }
 return JSON.stringify({id: proj.id(), name: proj.name(), status: proj.status()});`,
-          params,
+          {
+            ...params,
+            tagsNeedJson,
+          },
         );
 
         const created = JSON.parse(result) as { id: string };
-        if (usesSpecialWhen(params.when)) {
-          await applyQuietWhen(runtime, "project", created.id, params.when);
+        const operation = buildJsonUpdateOperation("project", created.id, {
+          when: specialWhen,
+          tags: tagsNeedJson ? params.tags : undefined,
+        });
+        if (operation) {
+          await runtime.quietJson([operation]);
           return ok(await readItemJson(runtime, created.id));
         }
 
@@ -479,11 +847,12 @@ return JSON.stringify({id: proj.id(), name: proj.name(), status: proj.status()})
       id: z.string().describe("Todo or project ID"),
       title: z.string().optional(),
       notes: z.string().optional().describe("Replace notes (use empty string to clear)"),
-      when: whenSchema
+      when: updateWhenSchema
         .optional()
-        .describe("today | tomorrow | evening | anytime | someday | yyyy-mm-dd"),
+        .describe("today | tomorrow | evening | anytime | someday | yyyy-mm-dd | empty string to clear"),
       deadline: updateDeadlineSchema.optional().describe("yyyy-mm-dd (empty string to clear)"),
       tags: z.array(z.string()).optional().describe("Replace all tags"),
+      checklist_items: z.array(z.string()).optional().describe("Replace all checklist items"),
       completed: z.boolean().optional(),
       canceled: z.boolean().optional(),
       list: z
@@ -493,7 +862,11 @@ return JSON.stringify({id: proj.id(), name: proj.name(), status: proj.status()})
     },
     async (params) => {
       try {
-        if (usesSpecialWhen(params.when)) {
+        const specialWhen = usesSpecialWhen(params.when) ? params.when : undefined;
+        const tagsNeedJson = needsJsonTagWrite(params.tags);
+        const needsUrlWhenClear = params.when === "";
+        const needsJsonPatch = specialWhen != null || params.checklist_items != null || tagsNeedJson;
+        if (needsUrlWhenClear || needsJsonPatch) {
           requireToken(runtime.token);
         }
 
@@ -503,7 +876,7 @@ try { item = app.toDos.byId(P.id); item.id(); type = "todo"; }
 catch(e) { item = app.projects.byId(P.id); item.id(); type = "project"; }
 if (P.hasOwnProperty("title") && P.title) item.name = P.title;
 if (P.hasOwnProperty("notes")) item.notes = P.notes || "";
-if (P.hasOwnProperty("tags")) item.tagNames = P.tags ? P.tags.join(", ") : "";
+if (P.hasOwnProperty("tags") && !P.tagsNeedJson) item.tagNames = P.tags ? P.tags.join(", ") : "";
 if (P.hasOwnProperty("deadline")) item.dueDate = P.deadline ? new Date(P.deadline + "T12:00:00") : null;
 if (P.list) {
   if (type === "todo") {
@@ -530,7 +903,10 @@ if (P.canceled) item.status = "canceled";
 else if (P.completed) item.status = "completed";
 else if (P.completed === false || P.canceled === false) item.status = "open";
 return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projectOf(item)});`,
-          params,
+          {
+            ...params,
+            tagsNeedJson,
+          },
         );
 
         const parsed = JSON.parse(result) as {
@@ -538,12 +914,129 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
           item: unknown;
         };
 
-        if (usesSpecialWhen(params.when)) {
-          await applyQuietWhen(runtime, parsed.kind, params.id, params.when);
+        if (needsUrlWhenClear) {
+          await applyQuietUpdate(runtime, parsed.kind, params.id, { when: "" });
+          return ok(await readItemJson(runtime, params.id));
+        }
+
+        const operation = buildJsonUpdateOperation(parsed.kind, params.id, {
+          tags: tagsNeedJson ? params.tags : undefined,
+          when: specialWhen,
+          checklist_items: params.checklist_items,
+        });
+        if (operation) {
+          await runtime.quietJson([operation]);
           return ok(await readItemJson(runtime, params.id));
         }
 
         return ok(JSON.stringify(parsed.item));
+      } catch (error) {
+        return fail(errmsg(error));
+      }
+    },
+  );
+
+  tools.bulk_update = server.tool(
+    "bulk_update",
+    "Update multiple todos or projects at once. Uses Things JSON updates and requires THINGS_AUTH_TOKEN.",
+    {
+      ids: z.array(z.string()).min(1).describe("Todo or project IDs"),
+      title: z.string().optional(),
+      notes: z.string().optional().describe("Replace notes"),
+      when: whenSchema.optional().describe("today | tomorrow | evening | anytime | someday | yyyy-mm-dd"),
+      deadline: deadlineSchema.optional().describe("yyyy-mm-dd"),
+      tags: z.array(z.string()).optional().describe("Replace all tags"),
+      checklist_items: z.array(z.string()).optional().describe("Replace all checklist items on todos"),
+      completed: z.boolean().optional(),
+      canceled: z.boolean().optional(),
+      list: z.string().optional().describe("Move todos to a project/area, or projects to an area"),
+    },
+    async (params) => {
+      try {
+        requireToken(runtime.token);
+        const detail = await runtime.jxa(
+          `return JSON.stringify(P.ids.map(function(id) {
+  try {
+    var todo = app.toDos.byId(id); todo.id();
+    return {id: id, kind: "todo"};
+  } catch(e) {
+    var project = app.projects.byId(id); project.id();
+    return {id: id, kind: "project"};
+  }
+}));`,
+          { ids: params.ids },
+        );
+        const items = JSON.parse(detail) as Array<{ id: string; kind: "todo" | "project" }>;
+        const operations = items
+          .map((item) =>
+            buildJsonUpdateOperation(item.kind, item.id, {
+              title: params.title,
+              notes: params.notes,
+              when: params.when,
+              deadline: params.deadline,
+              tags: params.tags,
+              list: params.list,
+              completed: params.completed,
+              canceled: params.canceled,
+              checklist_items: params.checklist_items,
+            }),
+          )
+          .filter((operation): operation is Record<string, unknown> => operation != null);
+        if (!operations.length) {
+          return fail("Provide at least one field to update");
+        }
+        await runtime.quietJson(operations);
+        return ok(JSON.stringify(items.map((item) => ({ id: item.id, kind: item.kind, updated: true }))));
+      } catch (error) {
+        return fail(errmsg(error));
+      }
+    },
+  );
+
+  tools.delete = server.tool(
+    "delete",
+    "Move a todo, project, or area to Things Trash.",
+    {
+      id: z.string().describe("Todo, project, or area ID"),
+    },
+    async ({ id }) => {
+      try {
+        const result = await runtime.jxa(
+          `try {
+  var todo = app.toDos.byId(P.id); todo.id();
+  app.delete(todo);
+  return JSON.stringify({id: P.id, kind: "todo", deleted: true});
+} catch(e1) {
+  try {
+    var project = app.projects.byId(P.id); project.id();
+    app.delete(project);
+    return JSON.stringify({id: P.id, kind: "project", deleted: true});
+  } catch(e2) {
+    var area = app.areas.byId(P.id); area.id();
+    app.delete(area);
+    return JSON.stringify({id: P.id, kind: "area", deleted: true});
+  }
+}`,
+          { id },
+        );
+        return ok(result);
+      } catch (error) {
+        return fail(errmsg(error));
+      }
+    },
+  );
+
+  tools.empty_trash = server.tool(
+    "empty_trash",
+    "Permanently delete everything currently in Things Trash.",
+    {},
+    async () => {
+      try {
+        await runtime.jxa(
+          `app.emptyTrash();
+return JSON.stringify({emptied: true});`,
+        );
+        return ok('{"emptied":true}');
       } catch (error) {
         return fail(errmsg(error));
       }
