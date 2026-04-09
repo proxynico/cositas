@@ -407,7 +407,16 @@ describe("search", () => {
     await callTool(tools.search.handler, { query: "ship", tag: "ops" });
     expect(jxaCalls[0]?.args).toEqual({ q: "ship", t: "ops" });
     expect(jxaCalls[0]?.body).toContain('app.toDos.whose({name: {_contains: P.q}})()');
-    expect(jxaCalls[0]?.body).toContain('tag.name() === P.t');
+    expect(jxaCalls[0]?.body).toContain("return tagsOf(t).some(function(tagName)");
+  });
+
+  test("uses shared tag fallback logic for tag-only searches", async () => {
+    const { tools, jxaCalls } = createMockApp({
+      jxa: async () => "[]",
+    });
+
+    await callTool(tools.search.handler, { tag: "ops" });
+    expect(jxaCalls[0]?.body).toContain("return tagsOf(t).some(function(tagName)");
   });
 
   test("returns search errors from jxa", async () => {
@@ -622,6 +631,40 @@ describe("update", () => {
     expect(jxaCalls).toHaveLength(2);
   });
 
+  test("sends an empty checklist payload when clearing checklist items", async () => {
+    let callIndex = 0;
+    const { tools, quietJsonCalls } = createMockApp({
+      jxa: async () => {
+        callIndex += 1;
+        return callIndex === 1
+          ? '{"kind":"todo","item":{"id":"1","name":"Updated"}}'
+          : '{"id":"1","name":"Updated","checklistItems":[]}';
+      },
+    });
+
+    const result = await callTool(tools.update.handler, {
+      id: "1",
+      checklist_items: [],
+    });
+
+    expect(textOf(result)).toContain('"checklistItems":[]');
+    expect(quietJsonCalls).toEqual([
+      {
+        operations: [
+          {
+            type: "to-do",
+            operation: "update",
+            id: "1",
+            attributes: {
+              "checklist-items": [],
+            },
+          },
+        ],
+        reveal: undefined,
+      },
+    ]);
+  });
+
   test("clears when via direct update url", async () => {
     let callIndex = 0;
     const { tools, quietCalls } = createMockApp({
@@ -708,6 +751,34 @@ describe("bulk_update", () => {
             attributes: {
               title: "Updated",
               when: "someday",
+            },
+          },
+        ],
+        reveal: undefined,
+      },
+    ]);
+  });
+
+  test("normalizes conflicting terminal states to canceled", async () => {
+    const { tools, quietJsonCalls } = createMockApp({
+      jxa: async () => '[{"id":"1","kind":"todo"}]',
+    });
+
+    await callTool(tools.bulk_update.handler, {
+      ids: ["1"],
+      completed: true,
+      canceled: true,
+    });
+
+    expect(quietJsonCalls).toEqual([
+      {
+        operations: [
+          {
+            type: "to-do",
+            operation: "update",
+            id: "1",
+            attributes: {
+              canceled: true,
             },
           },
         ],

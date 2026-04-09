@@ -446,11 +446,21 @@ function needsJsonTagWrite(tags: string[] | undefined): boolean {
 }
 
 function toChecklistItems(items: string[] | undefined): Array<Record<string, unknown>> | undefined {
-  if (!items?.length) return undefined;
+  if (items == null) return undefined;
   return items.map((title) => ({
     type: "checklist-item",
     attributes: { title },
   }));
+}
+
+function normalizeStatusPatch(completed: boolean | undefined, canceled: boolean | undefined): {
+  completed?: boolean;
+  canceled?: boolean;
+} {
+  if (canceled === true) return { canceled: true };
+  if (completed === true) return { completed: true };
+  if (completed === false || canceled === false) return { completed: false, canceled: false };
+  return {};
 }
 
 function buildJsonUpdateOperation(
@@ -469,13 +479,14 @@ function buildJsonUpdateOperation(
   },
 ): Record<string, unknown> | null {
   const attributes: Record<string, unknown> = {};
+  const status = normalizeStatusPatch(params.completed, params.canceled);
   if (params.title != null) attributes.title = params.title;
   if (params.notes != null) attributes.notes = params.notes;
   if (params.when != null && params.when !== "") attributes.when = params.when;
   if (params.deadline != null && params.deadline !== "") attributes.deadline = params.deadline;
   if (params.tags != null) attributes.tags = params.tags;
-  if (params.completed != null) attributes.completed = params.completed;
-  if (params.canceled != null) attributes.canceled = params.canceled;
+  if (status.completed != null) attributes.completed = status.completed;
+  if (status.canceled != null) attributes.canceled = status.canceled;
   if (kind === "todo" && params.list != null) attributes.list = params.list;
   if (kind === "project" && params.list != null) attributes.area = params.list;
   if (kind === "todo" && params.checklist_items != null) {
@@ -679,11 +690,7 @@ return JSON.stringify(items);`,
 results = results.filter(function(t) { return t.status() === "open"; });
 if (P.t) {
   results = results.filter(function(t) {
-    try {
-      return t.tags().some(function(tag) { return tag.name() === P.t; });
-    } catch(e) {
-      return false;
-    }
+    return tagsOf(t).some(function(tagName) { return tagName === P.t; });
   });
 }
 return JSON.stringify(results.map(todoOf));`,
@@ -1082,7 +1089,9 @@ export function createServer(runtime = createRuntime()): {
 
 /* v8 ignore next 4 */
 if (import.meta.main) {
+  const runtime = createRuntime();
+  await verifyThingsAccess(runtime);
   const transport = new StdioServerTransport();
-  const { server } = createServer();
+  const { server } = createServer(runtime);
   await server.connect(transport);
 }

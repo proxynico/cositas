@@ -13,7 +13,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that gives AI
 | `add_todo` | Create todos with notes, deadlines, tags, checklists, project placement |
 | `add_project` | Create projects with child todos and area placement |
 | `update` | Change any item by ID — figures out if it's a todo or project on its own |
-| `bulk_update` | Update a pile of items in one shot |
+| `bulk_update` | Update a pile of items in one shot. If `completed` and `canceled` conflict, `canceled` wins. |
 | `delete` | Trash it |
 | `empty_trash` | Really trash it |
 | `show` | Point Things at something without yanking it to the foreground |
@@ -62,6 +62,8 @@ Grab the auth token from Things: **Settings > General > Enable Things URLs**.
 **Things URL/JSON commands** pick up what JXA drops: bulk updates, checklists, and scheduling values that JXA pretends don't exist.
 
 **SQLite** speeds up `logbook` and `trash` by querying IDs from the local Things database first, then hydrating through JXA. On by default, zero config.
+
+**Startup** does a read-only Things access probe before the MCP server connects, so missing automation permission or a bad app path fails fast instead of surfacing on the first tool call.
 
 ## Development
 

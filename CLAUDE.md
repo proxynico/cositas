@@ -26,9 +26,11 @@ Things 3 MCP server for macOS. Background read/write automation via JXA, with Th
 
 - Primary read/write path is JXA against Things.
 - Bulk updates, special `when` values, checklist writes, and comma-containing tag writes use Things URL / JSON updates and require `THINGS_AUTH_TOKEN`.
+- If `completed` and `canceled` both arrive in a bulk update, `canceled` wins to match single-item `update`.
 - `logbook` and `trash` can use the local Things SQLite DB to page/filter IDs quickly, then hydrate final item details through JXA.
 - Built-in list reads can include both todos and projects. Mixed ordering uses DB sort keys when available.
 - Exact area reads still use project filtering because `area.projects()` is unreliable in JXA here.
+- Process startup performs a read-only access probe so automation permission or app-path problems fail immediately.
 
 ## Config
 
