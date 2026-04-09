@@ -20,7 +20,7 @@ import {
 
 const exec = promisify(execFile) as ExecFn;
 
-function discoverThingsDbPath(): string | null {
+export function discoverThingsDbPath(): string | null {
   if (THINGS_DB_PATH) {
     return existsSync(THINGS_DB_PATH) ? THINGS_DB_PATH : null;
   }
@@ -45,6 +45,17 @@ export function createRuntime({
 
   return {
     token,
+    inspect() {
+      if (dbPath === undefined) {
+        dbPath = discoverThingsDbPath();
+      }
+      return {
+        appPath: THINGS_APP_PATH,
+        appPathExists: existsSync(THINGS_APP_PATH),
+        fastReadsEnabled: THINGS_FAST_READS,
+        dbPath,
+      };
+    },
 
     async jxa(body, args = {}) {
       const { stdout } = await execFn("osascript", [

@@ -15,6 +15,7 @@ import {
   usesSpecialWhen,
   whenSchema,
 } from "./shared";
+import { verifyThingsAccess } from "./runtime";
 
 async function readItemJson(runtime: ThingsRuntime, id: string): Promise<string> {
   return runtime.jxa(
@@ -51,8 +52,94 @@ async function applyQuietUpdate(
   });
 }
 
+async function buildDoctorReport(runtime: ThingsRuntime): Promise<string> {
+  const inspection = runtime.inspect();
+  const checks: Record<string, Record<string, unknown>> = {
+    app_path: {
+      ok: inspection.appPathExists,
+      path: inspection.appPath,
+      message: inspection.appPathExists ? "Things app path exists" : "Things app path does not exist",
+    },
+    auth_token: {
+      ok: Boolean(runtime.token),
+      configured: Boolean(runtime.token),
+      message: runtime.token
+        ? "THINGS_AUTH_TOKEN is configured for JSON update paths"
+        : "THINGS_AUTH_TOKEN is missing; JSON update paths are unavailable",
+    },
+  };
+
+  let ok = inspection.appPathExists && Boolean(runtime.token);
+
+  try {
+    await verifyThingsAccess(runtime);
+    checks.things_access = {
+      ok: true,
+      message: "Things automation is reachable",
+    };
+  } catch (error) {
+    checks.things_access = {
+      ok: false,
+      message: errmsg(error),
+    };
+    ok = false;
+  }
+
+  if (!inspection.fastReadsEnabled) {
+    checks.fast_reads = {
+      ok: true,
+      enabled: false,
+      available: false,
+      db_path: null,
+      message: "Fast SQLite reads are disabled by configuration",
+    };
+  } else if (!inspection.dbPath) {
+    checks.fast_reads = {
+      ok: true,
+      enabled: true,
+      available: false,
+      db_path: null,
+      message: "No Things database found; falling back to JXA reads",
+    };
+  } else {
+    try {
+      await runtime.fastListRead("logbook", { limit: 1, offset: 0 });
+      checks.fast_reads = {
+        ok: true,
+        enabled: true,
+        available: true,
+        db_path: inspection.dbPath,
+        message: "Fast SQLite reads are available",
+      };
+    } catch (error) {
+      checks.fast_reads = {
+        ok: false,
+        enabled: true,
+        available: false,
+        db_path: inspection.dbPath,
+        message: errmsg(error),
+      };
+    }
+  }
+
+  return JSON.stringify({ ok, checks });
+}
+
 export function registerTools(server: McpServer, runtime: ThingsRuntime): Record<string, RegisteredTool> {
   const tools: Record<string, RegisteredTool> = {};
+
+  tools.doctor = server.tool(
+    "doctor",
+    "Run non-mutating health checks for Things app access, auth token setup, and fast-read availability.",
+    {},
+    async () => {
+      try {
+        return ok(await buildDoctorReport(runtime));
+      } catch (error) {
+        return fail(errmsg(error));
+      }
+    },
+  );
 
   tools.read = server.tool(
     "read",

@@ -5,6 +5,7 @@ import {
   errmsg,
   isSandboxAutomationError,
   LIST_NAMES,
+  type RuntimeInspection,
   type ThingsRuntime,
   verifyThingsAccess,
 } from "./index";
@@ -21,6 +22,7 @@ function createMockApp({
   quietJson,
   fastListRead,
   sortListItems,
+  inspect,
 }: {
   token?: string;
   jxa?: (body: string, args?: Record<string, unknown>) => Promise<string> | string;
@@ -36,6 +38,7 @@ function createMockApp({
     },
   ) => Promise<string | null> | string | null;
   sortListItems?: (list: string, items: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
+  inspect?: () => RuntimeInspection;
 } = {}) {
   const jxaCalls: Call[] = [];
   const quietCalls: Array<{ path: string; params: Record<string, string | undefined> }> = [];
@@ -61,6 +64,16 @@ function createMockApp({
     },
     sortListItems(list, items) {
       return sortListItems ? sortListItems(list, items) : items;
+    },
+    inspect() {
+      return inspect
+        ? inspect()
+        : {
+            appPath: "/Applications/Things3.app",
+            appPathExists: true,
+            fastReadsEnabled: true,
+            dbPath: null,
+          };
     },
   };
 
@@ -175,6 +188,14 @@ describe("runtime", () => {
       async quietJson() {},
       async fastListRead() { return null; },
       sortListItems(_list, items) { return items; },
+      inspect() {
+        return {
+          appPath: "/Applications/Things3.app",
+          appPathExists: true,
+          fastReadsEnabled: true,
+          dbPath: null,
+        };
+      },
     };
 
     await verifyThingsAccess(runtime);
@@ -194,6 +215,14 @@ describe("runtime", () => {
       async quietJson() {},
       async fastListRead() { return null; },
       sortListItems(_list, items) { return items; },
+      inspect() {
+        return {
+          appPath: "/Applications/Things3.app",
+          appPathExists: true,
+          fastReadsEnabled: true,
+          dbPath: null,
+        };
+      },
     };
 
     expect(verifyThingsAccess(runtime)).rejects.toThrow(
@@ -211,6 +240,14 @@ describe("runtime", () => {
       async quietJson() {},
       async fastListRead() { return null; },
       sortListItems(_list, items) { return items; },
+      inspect() {
+        return {
+          appPath: "/Applications/Things3.app",
+          appPathExists: true,
+          fastReadsEnabled: true,
+          dbPath: null,
+        };
+      },
     };
 
     expect(verifyThingsAccess(runtime)).rejects.toThrow(
@@ -388,6 +425,62 @@ describe("read", () => {
     const result = await callTool(tools.read.handler, { list: "today" });
     expect(isError(result)).toBeTrue();
     expect(textOf(result)).toBe("boom");
+  });
+});
+
+describe("doctor", () => {
+  test("reports a healthy runtime when access, token, and fast reads are available", async () => {
+    const { tools } = createMockApp({
+      jxa: async () => '["Inbox","Today"]',
+      fastListRead: async () => "[]",
+      inspect: () => ({
+        appPath: "/Applications/Things3.app",
+        appPathExists: true,
+        fastReadsEnabled: true,
+        dbPath: "/tmp/main.sqlite",
+      }),
+    });
+
+    const result = await callTool(tools.doctor.handler, {});
+    const report = JSON.parse(textOf(result) ?? "{}") as {
+      ok: boolean;
+      checks: Record<string, { ok: boolean; message: string; available?: boolean }>;
+    };
+
+    expect(report.ok).toBeTrue();
+    expect(report.checks.app_path?.ok).toBeTrue();
+    expect(report.checks.auth_token?.ok).toBeTrue();
+    expect(report.checks.things_access?.ok).toBeTrue();
+    expect(report.checks.fast_reads?.ok).toBeTrue();
+    expect(report.checks.fast_reads?.available).toBeTrue();
+  });
+
+  test("reports missing token and startup failures without crashing", async () => {
+    const { tools } = createMockApp({
+      token: "",
+      jxa: async () => {
+        throw new Error("Application can't be found.");
+      },
+      inspect: () => ({
+        appPath: "/Applications/MissingThings.app",
+        appPathExists: false,
+        fastReadsEnabled: true,
+        dbPath: null,
+      }),
+    });
+
+    const result = await callTool(tools.doctor.handler, {});
+    const report = JSON.parse(textOf(result) ?? "{}") as {
+      ok: boolean;
+      checks: Record<string, { ok: boolean; message: string }>;
+    };
+
+    expect(report.ok).toBeFalse();
+    expect(report.checks.app_path?.ok).toBeFalse();
+    expect(report.checks.auth_token?.ok).toBeFalse();
+    expect(report.checks.things_access?.ok).toBeFalse();
+    expect(report.checks.things_access?.message).toBe("Things 3 startup check failed: Application can't be found.");
+    expect(report.checks.fast_reads?.ok).toBeTrue();
   });
 });
 

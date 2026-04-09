@@ -8,7 +8,7 @@ import type { ThingsRuntime } from "./shared";
 import { createRuntime, verifyThingsAccess } from "./runtime";
 import { registerTools } from "./tools";
 
-export type { ExecFn, ExecResult, ThingsRuntime } from "./shared";
+export type { ExecFn, ExecResult, RuntimeInspection, ThingsRuntime } from "./shared";
 export {
   buildJsonUpdateOperation,
   deadlineSchema,

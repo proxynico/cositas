@@ -6,6 +6,13 @@ export type ExecResult = {
 
 export type ExecFn = (file: string, args: string[]) => Promise<ExecResult>;
 
+export type RuntimeInspection = {
+  appPath: string;
+  appPathExists: boolean;
+  fastReadsEnabled: boolean;
+  dbPath: string | null;
+};
+
 export type ThingsRuntime = {
   jxa(body: string, args?: Record<string, unknown>): Promise<string>;
   quietUrl(path: string, params: Record<string, string | undefined>): Promise<void>;
@@ -20,6 +27,7 @@ export type ThingsRuntime = {
     },
   ): Promise<string | null>;
   sortListItems(list: string, items: Array<Record<string, unknown>>): Array<Record<string, unknown>>;
+  inspect(): RuntimeInspection;
   token: string;
 };
 

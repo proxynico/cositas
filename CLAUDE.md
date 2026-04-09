@@ -12,6 +12,7 @@ Things 3 MCP server for macOS. Background read/write automation via JXA, with Th
 
 ## Tools
 
+- `doctor`
 - `read`
 - `search`
 - `add_todo`
@@ -31,6 +32,7 @@ Things 3 MCP server for macOS. Background read/write automation via JXA, with Th
 - Built-in list reads can include both todos and projects. Mixed ordering uses DB sort keys when available.
 - Exact area reads still use project filtering because `area.projects()` is unreliable in JXA here.
 - Process startup performs a read-only access probe so automation permission or app-path problems fail immediately.
+- `doctor` exposes the same checks on demand without mutating Things data.
 
 ## Config
 

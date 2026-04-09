@@ -8,6 +8,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that gives AI
 
 | Tool | |
 |------|--|
+| `doctor` | Run a non-mutating health check for app access, auth-token setup, and fast-read availability |
 | `read` | Pull any list, project, area, or item. Paginate, filter by completion date — the works. |
 | `search` | Find open todos by name or tag |
 | `add_todo` | Create todos with notes, deadlines, tags, checklists, project placement |
@@ -64,6 +65,8 @@ Grab the auth token from Things: **Settings > General > Enable Things URLs**.
 **JXA** is now the thin macOS runtime boundary: item hydration, direct app actions, and the few operations where the URL/JSON path is not a clean fit.
 
 **Startup** does a read-only Things access probe before the MCP server connects, so missing automation permission or a bad app path fails fast instead of surfacing on the first tool call.
+
+**Doctor** gives you the same checks on demand from the MCP side: app path, automation reachability, auth token presence, and whether the SQLite fast-read path is usable.
 
 ## Development
 
