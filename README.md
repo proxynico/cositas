@@ -57,11 +57,11 @@ Grab the auth token from Things: **Settings > General > Enable Things URLs**.
 
 ## Under the hood
 
-**JXA** does the heavy lifting. Reads and most writes go through `osascript` with structured JSON args — no string-interpolated script fragments.
+**SQLite-first reads** handle the heavy list work where Things stores the truth locally. Fast paths use the Things database for paging, filtering, and ordering, then hydrate final item shapes through the runtime boundary when needed.
 
-**Things URL/JSON commands** pick up what JXA drops: bulk updates, checklists, and scheduling values that JXA pretends don't exist.
+**Things URL/JSON commands** are the primary write fallback for bulk updates, checklists, comma-containing tags, and scheduling values that JXA does not model cleanly.
 
-**SQLite** speeds up `logbook` and `trash` by querying IDs from the local Things database first, then hydrating through JXA. On by default, zero config.
+**JXA** is now the thin macOS runtime boundary: item hydration, direct app actions, and the few operations where the URL/JSON path is not a clean fit.
 
 **Startup** does a read-only Things access probe before the MCP server connects, so missing automation permission or a bad app path fails fast instead of surfacing on the first tool call.
 
