@@ -7,6 +7,8 @@ import {
   fail,
   LIST_NAMES,
   needsJsonTagWrite,
+  normalizeThingsJson,
+  normalizeThingsValue,
   ok,
   requireToken,
   ThingsRuntime,
@@ -18,8 +20,9 @@ import {
 import { verifyThingsAccess } from "./runtime";
 
 async function readItemJson(runtime: ThingsRuntime, id: string): Promise<string> {
-  return runtime.jxa(
-    `try {
+  return normalizeThingsJson(
+    await runtime.jxa(
+      `try {
   var t = app.toDos.byId(P.id); t.id();
   var r = todoOf(t);
   try {
@@ -34,7 +37,8 @@ async function readItemJson(runtime: ThingsRuntime, id: string): Promise<string>
   r.todos = p.toDos().map(todoOf);
   return JSON.stringify(r);
 }`,
-    { id },
+      { id },
+    ),
   );
 }
 
@@ -69,7 +73,7 @@ async function buildDoctorReport(runtime: ThingsRuntime): Promise<string> {
     },
   };
 
-  let ok = inspection.appPathExists && Boolean(runtime.token);
+  let ok = inspection.appPathExists;
 
   try {
     await verifyThingsAccess(runtime);
@@ -103,7 +107,10 @@ async function buildDoctorReport(runtime: ThingsRuntime): Promise<string> {
     };
   } else {
     try {
-      await runtime.fastListRead("logbook", { limit: 1, offset: 0 });
+      const fast = await runtime.fastListRead("logbook", { limit: 1, offset: 0 });
+      if (fast == null) {
+        throw new Error("Fast SQLite reads are not available");
+      }
       checks.fast_reads = {
         ok: true,
         enabled: true,
@@ -112,6 +119,7 @@ async function buildDoctorReport(runtime: ThingsRuntime): Promise<string> {
         message: "Fast SQLite reads are available",
       };
     } catch (error) {
+      ok = false;
       checks.fast_reads = {
         ok: false,
         enabled: true,
@@ -186,10 +194,12 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
       try {
         if (list === "projects") {
           return ok(
-            await runtime.jxa(
+            normalizeThingsJson(
+              await runtime.jxa(
               `return JSON.stringify(app.projects().filter(function(p){
   return p.status()==="open";
 }).map(projectOf));`,
+            ),
             ),
           );
         }
@@ -220,7 +230,8 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
 
         if (project) {
           return ok(
-            await runtime.jxa(
+            normalizeThingsJson(
+              await runtime.jxa(
               `var p = app.projects.byName(P.n); p.id();
 return JSON.stringify(applyReadWindow(p.toDos()).map(todoOf));`,
               {
@@ -231,12 +242,14 @@ return JSON.stringify(applyReadWindow(p.toDos()).map(todoOf));`,
                 completedBefore: completed_before ?? null,
               },
             ),
+            ),
           );
         }
 
         if (area) {
           return ok(
-            await runtime.jxa(
+            normalizeThingsJson(
+              await runtime.jxa(
               `var target = P.n;
 var projs = app.projects().filter(function(p) {
   if (p.status() !== "open") return false;
@@ -245,6 +258,7 @@ var projs = app.projects().filter(function(p) {
 });
 return JSON.stringify(projs.map(projectOf));`,
               { n: area },
+            ),
             ),
           );
         }
@@ -275,20 +289,21 @@ if (P.completedAfter || P.completedBefore) {
     return true;
   });
 }
-var start = P.offset || 0;
-if (P.limit != null) items = items.slice(start, start + P.limit);
-else if (start) items = items.slice(start);
 return JSON.stringify(items);`,
           {
             n: LIST_NAMES[list!],
-            limit: limit ?? null,
-            offset: offset ?? 0,
             completedAfter: completed_after ?? null,
             completedBefore: completed_before ?? null,
           },
         );
 
-        return ok(JSON.stringify(runtime.sortListItems(list!, JSON.parse(mixed) as Array<Record<string, unknown>>)));
+        const sorted = runtime.sortListItems(
+          list!,
+          JSON.parse(normalizeThingsJson(mixed)) as Array<Record<string, unknown>>,
+        );
+        const start = offset ?? 0;
+        const paged = limit != null ? sorted.slice(start, start + limit) : sorted.slice(start);
+        return ok(JSON.stringify(paged));
       } catch (error) {
         return fail(errmsg(error));
       }
@@ -306,7 +321,8 @@ return JSON.stringify(items);`,
       if (!query && !tag) return fail("Provide query or tag");
       try {
         return ok(
-          await runtime.jxa(
+          normalizeThingsJson(
+            await runtime.jxa(
             `var results = P.q ? app.toDos.whose({name: {_contains: P.q}})() : app.toDos();
 results = results.filter(function(t) { return t.status() === "open"; });
 if (P.t) {
@@ -316,6 +332,7 @@ if (P.t) {
 }
 return JSON.stringify(results.map(todoOf));`,
             { q: query ?? null, t: tag ?? null },
+          ),
           ),
         );
       } catch (error) {
@@ -556,7 +573,7 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
           return ok(await readItemJson(runtime, params.id));
         }
 
-        return ok(JSON.stringify(parsed.item));
+        return ok(JSON.stringify(normalizeThingsValue(parsed.item)));
       } catch (error) {
         return fail(errmsg(error));
       }

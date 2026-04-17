@@ -5,6 +5,7 @@ import {
   errmsg,
   isSandboxAutomationError,
   LIST_NAMES,
+  normalizeThingsJson,
   type RuntimeInspection,
   type ThingsRuntime,
   verifyThingsAccess,
@@ -291,8 +292,6 @@ describe("read", () => {
     await callTool(tools.read.handler, { list: "today" });
     expect(jxaCalls[0]?.args).toEqual({
       n: LIST_NAMES.today,
-      limit: null,
-      offset: 0,
       completedAfter: null,
       completedBefore: null,
     });
@@ -342,10 +341,29 @@ describe("read", () => {
     expect(jxaCalls[0]?.body).toContain("P.completedAfter || P.completedBefore");
     expect(jxaCalls[0]?.args).toEqual({
       n: LIST_NAMES.logbook,
-      limit: 25,
-      offset: 50,
       completedAfter: "2026-04-01",
       completedBefore: "2026-04-06",
+    });
+  });
+
+  test("applies built-in list pagination after sorting the full result set", async () => {
+    const { tools, jxaCalls } = createMockApp({
+      jxa: async () =>
+        '[{"id":"todo-1","kind":"todo"},{"id":"todo-2","kind":"todo"},{"id":"proj-1","kind":"project"}]',
+      sortListItems: (_list, items) => [items[2]!, items[0]!, items[1]!],
+    });
+
+    const result = await callTool(tools.read.handler, {
+      list: "today",
+      limit: 1,
+      offset: 1,
+    });
+
+    expect(textOf(result)).toBe('[{"id":"todo-1","kind":"todo"}]');
+    expect(jxaCalls[0]?.args).toEqual({
+      n: LIST_NAMES.today,
+      completedAfter: null,
+      completedBefore: null,
     });
   });
 
@@ -481,6 +499,133 @@ describe("doctor", () => {
     expect(report.checks.things_access?.ok).toBeFalse();
     expect(report.checks.things_access?.message).toBe("Things 3 startup check failed: Application can't be found.");
     expect(report.checks.fast_reads?.ok).toBeTrue();
+  });
+
+  test("stays healthy overall when read access works but write auth is not configured", async () => {
+    const { tools } = createMockApp({
+      token: "",
+      jxa: async () => '["Inbox","Today"]',
+      inspect: () => ({
+        appPath: "/Applications/Things3.app",
+        appPathExists: true,
+        fastReadsEnabled: true,
+        dbPath: null,
+      }),
+    });
+
+    const result = await callTool(tools.doctor.handler, {});
+    const report = JSON.parse(textOf(result) ?? "{}") as {
+      ok: boolean;
+      checks: Record<string, { ok: boolean; message: string }>;
+    };
+
+    expect(report.ok).toBeTrue();
+    expect(report.checks.auth_token?.ok).toBeFalse();
+    expect(report.checks.things_access?.ok).toBeTrue();
+  });
+
+  test("fails overall when configured fast reads are broken", async () => {
+    const { tools } = createMockApp({
+      jxa: async () => '["Inbox","Today"]',
+      fastListRead: async () => {
+        throw new Error("database is locked");
+      },
+      inspect: () => ({
+        appPath: "/Applications/Things3.app",
+        appPathExists: true,
+        fastReadsEnabled: true,
+        dbPath: "/tmp/main.sqlite",
+      }),
+    });
+
+    const result = await callTool(tools.doctor.handler, {});
+    const report = JSON.parse(textOf(result) ?? "{}") as {
+      ok: boolean;
+      checks: Record<string, { ok: boolean; message: string }>;
+    };
+
+    expect(report.ok).toBeFalse();
+    expect(report.checks.things_access?.ok).toBeTrue();
+    expect(report.checks.fast_reads?.ok).toBeFalse();
+    expect(report.checks.fast_reads?.message).toBe("database is locked");
+  });
+});
+
+describe("normalization", () => {
+  test("normalizes terminal dates to match the current status across nested items", () => {
+    const normalized = JSON.parse(
+      normalizeThingsJson(
+        JSON.stringify([
+          {
+            id: "done",
+            status: "completed",
+            completionDate: "2026-04-16T11:23:18.000Z",
+            cancellationDate: "2026-04-16T11:23:18.000Z",
+          },
+          {
+            id: "canceled",
+            status: "canceled",
+            completionDate: "2026-04-16T11:23:18.000Z",
+            cancellationDate: null,
+          },
+          {
+            id: "open",
+            status: "open",
+            completionDate: "2026-04-16T11:23:18.000Z",
+            cancellationDate: "2026-04-16T11:23:18.000Z",
+          },
+          {
+            id: "project",
+            status: "completed",
+            completionDate: null,
+            cancellationDate: "2026-04-16T11:23:18.000Z",
+            todos: [
+              {
+                id: "nested",
+                status: "canceled",
+                completionDate: "2026-04-16T11:23:18.000Z",
+                cancellationDate: null,
+              },
+            ],
+          },
+        ]),
+      ),
+    ) as Array<Record<string, unknown>>;
+
+    expect(normalized).toEqual([
+      {
+        id: "done",
+        status: "completed",
+        completionDate: "2026-04-16T11:23:18.000Z",
+        cancellationDate: null,
+      },
+      {
+        id: "canceled",
+        status: "canceled",
+        completionDate: null,
+        cancellationDate: "2026-04-16T11:23:18.000Z",
+      },
+      {
+        id: "open",
+        status: "open",
+        completionDate: null,
+        cancellationDate: null,
+      },
+      {
+        id: "project",
+        status: "completed",
+        completionDate: "2026-04-16T11:23:18.000Z",
+        cancellationDate: null,
+        todos: [
+          {
+            id: "nested",
+            status: "canceled",
+            completionDate: null,
+            cancellationDate: "2026-04-16T11:23:18.000Z",
+          },
+        ],
+      },
+    ]);
   });
 });
 

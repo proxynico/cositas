@@ -14,6 +14,7 @@ import {
   isoDayToUnixEnd,
   isoDayToUnixStart,
   isSandboxAutomationError,
+  normalizeThingsJson,
   requireToken,
   ThingsRuntime,
 } from "./shared";
@@ -216,7 +217,8 @@ delay(0.5);`,
           return "[]";
         }
 
-        return await this.jxa(
+        return normalizeThingsJson(
+          await this.jxa(
           `return JSON.stringify(P.ids.map(function(id) {
   try {
     var todo = app.toDos.byId(id); todo.id();
@@ -226,7 +228,8 @@ delay(0.5);`,
     return projectOf(project);
   }
 }));`,
-          { ids: rows.map((row) => row.id) },
+            { ids: rows.map((row) => row.id) },
+          ),
         );
       } finally {
         db.close(false);

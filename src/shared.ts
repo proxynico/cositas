@@ -114,6 +114,46 @@ export function compareNullableNumber(a: number | null | undefined, b: number | 
   return av - bv;
 }
 
+export function normalizeThingsValue<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeThingsValue(entry)) as T;
+  }
+
+  if (value != null && typeof value === "object") {
+    const normalized = Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, normalizeThingsValue(entry)]),
+    ) as Record<string, unknown>;
+
+    const status = typeof normalized.status === "string" ? normalized.status : null;
+    const hasCompletionDate = Object.prototype.hasOwnProperty.call(normalized, "completionDate");
+    const hasCancellationDate = Object.prototype.hasOwnProperty.call(normalized, "cancellationDate");
+
+    if (status && (hasCompletionDate || hasCancellationDate)) {
+      const completionDate = normalized.completionDate ?? null;
+      const cancellationDate = normalized.cancellationDate ?? null;
+
+      if (status === "completed") {
+        normalized.completionDate = completionDate ?? cancellationDate ?? null;
+        normalized.cancellationDate = null;
+      } else if (status === "canceled") {
+        normalized.completionDate = null;
+        normalized.cancellationDate = cancellationDate ?? completionDate ?? null;
+      } else {
+        normalized.completionDate = null;
+        normalized.cancellationDate = null;
+      }
+    }
+
+    return normalized as T;
+  }
+
+  return value;
+}
+
+export function normalizeThingsJson(text: string): string {
+  return JSON.stringify(normalizeThingsValue(JSON.parse(text) as unknown));
+}
+
 export function usesSpecialWhen(value: string | undefined): value is string {
   return value != null && SPECIAL_WHEN.has(value);
 }

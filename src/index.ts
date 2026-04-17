@@ -15,6 +15,8 @@ export {
   errmsg,
   isSandboxAutomationError,
   LIST_NAMES,
+  normalizeThingsJson,
+  normalizeThingsValue,
   updateDeadlineSchema,
   updateWhenSchema,
   whenSchema,
