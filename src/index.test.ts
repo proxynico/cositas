@@ -7,9 +7,19 @@ import {
   LIST_NAMES,
   normalizeThingsJson,
   type RuntimeInspection,
+  type StatsResult,
+  type StatsWindow,
   type ThingsRuntime,
   verifyThingsAccess,
 } from "./index";
+import {
+  renderArea,
+  renderList,
+  renderProject,
+  renderTodo,
+  type MdProject,
+  type MdTodo,
+} from "./markdown";
 
 type Call = {
   body: string;
@@ -23,6 +33,7 @@ function createMockApp({
   quietJson,
   fastListRead,
   sortListItems,
+  statsQuery,
   inspect,
 }: {
   token?: string;
@@ -39,11 +50,13 @@ function createMockApp({
     },
   ) => Promise<string | null> | string | null;
   sortListItems?: (list: string, items: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
+  statsQuery?: (window: StatsWindow) => Promise<StatsResult | null> | StatsResult | null;
   inspect?: () => RuntimeInspection;
 } = {}) {
   const jxaCalls: Call[] = [];
   const quietCalls: Array<{ path: string; params: Record<string, string | undefined> }> = [];
   const quietJsonCalls: Array<{ operations: Array<Record<string, unknown>>; reveal?: boolean }> = [];
+  const statsCalls: Array<{ window: StatsWindow }> = [];
 
   const runtime: ThingsRuntime = {
     token,
@@ -66,6 +79,11 @@ function createMockApp({
     sortListItems(list, items) {
       return sortListItems ? sortListItems(list, items) : items;
     },
+    async statsQuery(window) {
+      statsCalls.push({ window });
+      if (!statsQuery) return null;
+      return (await statsQuery(window)) ?? null;
+    },
     inspect() {
       return inspect
         ? inspect()
@@ -79,7 +97,7 @@ function createMockApp({
   };
 
   const { tools } = createServer(runtime);
-  return { tools, jxaCalls, quietCalls, quietJsonCalls };
+  return { tools, jxaCalls, quietCalls, quietJsonCalls, statsCalls };
 }
 
 async function callTool(tool: unknown, args: Record<string, unknown>) {
@@ -189,6 +207,7 @@ describe("runtime", () => {
       async quietJson() {},
       async fastListRead() { return null; },
       sortListItems(_list, items) { return items; },
+      async statsQuery() { return null; },
       inspect() {
         return {
           appPath: "/Applications/Things3.app",
@@ -216,6 +235,7 @@ describe("runtime", () => {
       async quietJson() {},
       async fastListRead() { return null; },
       sortListItems(_list, items) { return items; },
+      async statsQuery() { return null; },
       inspect() {
         return {
           appPath: "/Applications/Things3.app",
@@ -241,6 +261,7 @@ describe("runtime", () => {
       async quietJson() {},
       async fastListRead() { return null; },
       sortListItems(_list, items) { return items; },
+      async statsQuery() { return null; },
       inspect() {
         return {
           appPath: "/Applications/Things3.app",
@@ -390,6 +411,27 @@ describe("read", () => {
     });
 
     expect(textOf(result)).toBe('[{"kind":"project","id":"p1"},{"kind":"todo","id":"t1"}]');
+    expect(jxaCalls).toHaveLength(0);
+  });
+
+  test("uses fast list reads for today and inbox so JXA quirks don't starve them", async () => {
+    const seen: string[] = [];
+    const { tools, jxaCalls } = createMockApp({
+      fastListRead: async (list) => {
+        seen.push(list);
+        if (list === "today") return '[{"kind":"todo","id":"t1","name":"Do"}]';
+        if (list === "inbox") return '[]';
+        return null;
+      },
+    });
+
+    const todayResult = await callTool(tools.read.handler, { list: "today" });
+    expect(textOf(todayResult)).toBe('[{"kind":"todo","id":"t1","name":"Do"}]');
+
+    const inboxResult = await callTool(tools.read.handler, { list: "inbox" });
+    expect(textOf(inboxResult)).toBe("[]");
+
+    expect(seen).toEqual(["today", "inbox"]);
     expect(jxaCalls).toHaveLength(0);
   });
 
@@ -1081,5 +1123,513 @@ describe("show", () => {
     const result = await callTool(tools.show.handler, { id: "1" });
     expect(isError(result)).toBeTrue();
     expect(textOf(result)).toBe("show failed");
+  });
+});
+
+describe("markdown renderer", () => {
+  const fullOpts = { includeNotes: true, includeCompleted: true };
+  const openOnly = { includeNotes: true, includeCompleted: false };
+
+  test("renders an open todo with checkbox, due date, and tags", () => {
+    const todo: MdTodo = {
+      id: "1",
+      name: "Write spec",
+      status: "open",
+      tags: ["docs", "q2"],
+      dueDate: "2026-05-01T12:00:00.000Z",
+    };
+    expect(renderTodo(todo, fullOpts)).toBe("- [ ] Write spec (due 2026-05-01) #docs #q2");
+  });
+
+  test("renders completed and canceled todos distinctly", () => {
+    const done: MdTodo = { id: "1", name: "Done", status: "completed" };
+    const killed: MdTodo = { id: "2", name: "Scrapped", status: "canceled" };
+    expect(renderTodo(done, fullOpts)).toBe("- [x] Done");
+    expect(renderTodo(killed, fullOpts)).toBe("- [x] Scrapped (canceled)");
+  });
+
+  test("indents todo notes by 4 spaces and preserves paragraph breaks", () => {
+    const todo: MdTodo = {
+      id: "1",
+      name: "With notes",
+      status: "open",
+      notes: "Para one.\n\nPara two with more text.",
+    };
+    expect(renderTodo(todo, openOnly)).toBe(
+      [
+        "- [ ] With notes",
+        "    Para one.",
+        "",
+        "    Para two with more text.",
+      ].join("\n"),
+    );
+  });
+
+  test("escapes leading list markers inside notes", () => {
+    const todo: MdTodo = {
+      id: "1",
+      name: "Has bullet in notes",
+      status: "open",
+      notes: "- this would collapse\n* this too\n1. numbered",
+    };
+    expect(renderTodo(todo, openOnly)).toBe(
+      [
+        "- [ ] Has bullet in notes",
+        "    \\- this would collapse",
+        "    \\* this too",
+        "    \\1. numbered",
+      ].join("\n"),
+    );
+  });
+
+  test("renders checklist items under a todo with 4-space indent", () => {
+    const todo: MdTodo = {
+      id: "1",
+      name: "Ship it",
+      status: "open",
+      checklistItems: [
+        { name: "draft", done: true },
+        { name: "review", done: false },
+      ],
+    };
+    expect(renderTodo(todo, fullOpts)).toBe(
+      [
+        "- [ ] Ship it",
+        "    - [x] draft",
+        "    - [ ] review",
+      ].join("\n"),
+    );
+  });
+
+  test("trusts markdown special chars in names and notes", () => {
+    const todo: MdTodo = {
+      id: "1",
+      name: "[brackets] *asterisks* #hashtag",
+      status: "open",
+      notes: "*emphasis* and #tag-style text survive",
+    };
+    expect(renderTodo(todo, openOnly)).toBe(
+      [
+        "- [ ] [brackets] *asterisks* #hashtag",
+        "    *emphasis* and #tag-style text survive",
+      ].join("\n"),
+    );
+  });
+
+  test("renders a project with frontmatter, heading, notes, and todos", () => {
+    const project: MdProject = {
+      kind: "project",
+      id: "p1",
+      name: "Launch",
+      status: "open",
+      area: "Engineering",
+      dueDate: "2026-05-01T00:00:00.000Z",
+      tags: ["q2"],
+      notes: "Kickoff notes.",
+      todos: [
+        { id: "t1", name: "Plan", status: "open" },
+        { id: "t2", name: "Build", status: "completed" },
+      ],
+    };
+    expect(renderProject(project, openOnly)).toBe(
+      [
+        "---",
+        'project: "Launch"',
+        'area: "Engineering"',
+        "due: 2026-05-01",
+        'tags: ["q2"]',
+        "---",
+        "",
+        "## Launch",
+        "",
+        "Kickoff notes.",
+        "",
+        "- [ ] Plan",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("project rendering includes completed todos when requested", () => {
+    const project: MdProject = {
+      kind: "project",
+      id: "p1",
+      name: "Launch",
+      status: "open",
+      todos: [
+        { id: "t1", name: "Plan", status: "open" },
+        { id: "t2", name: "Build", status: "completed" },
+      ],
+    };
+    const output = renderProject(project, fullOpts);
+    expect(output).toContain("- [ ] Plan");
+    expect(output).toContain("- [x] Build");
+  });
+
+  test("empty project emits *(empty)*", () => {
+    const project: MdProject = {
+      kind: "project",
+      id: "p1",
+      name: "Idle",
+      status: "open",
+      todos: [],
+    };
+    expect(renderProject(project, openOnly)).toContain("*(empty)*");
+  });
+
+  test("area renders frontmatter per project with ---/--- separators", () => {
+    const projects: MdProject[] = [
+      { kind: "project", id: "p1", name: "Alpha", status: "open", todoCount: 3 },
+      { kind: "project", id: "p2", name: "Beta", status: "open", todoCount: 1 },
+    ];
+    expect(renderArea("Engineering", projects)).toBe(
+      [
+        "# Engineering",
+        "",
+        "---",
+        'project: "Alpha"',
+        "---",
+        "",
+        "## Alpha",
+        "",
+        "*3 open todos*",
+        "",
+        "---",
+        "",
+        "---",
+        'project: "Beta"',
+        "---",
+        "",
+        "## Beta",
+        "",
+        "*1 open todo*",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("empty area emits *(no projects)*", () => {
+    expect(renderArea("Quiet", [])).toBe("# Quiet\n\n*(no projects)*\n");
+  });
+
+  test("list renders a mix of todos and projects with a leading H1", () => {
+    const items: Array<MdTodo | MdProject> = [
+      { id: "t1", name: "Buy coffee", status: "open" },
+      { kind: "project", id: "p1", name: "Launch", status: "open", todoCount: 5 },
+    ];
+    expect(renderList("today", items, openOnly)).toBe(
+      [
+        "# Today",
+        "",
+        "- [ ] Buy coffee",
+        "- [ ] **Launch** (5 todos)",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("empty list emits *(empty)*", () => {
+    expect(renderList("inbox", [], openOnly)).toBe("# Inbox\n\n*(empty)*\n");
+  });
+
+  test("YAML frontmatter quotes names containing colons", () => {
+    const project: MdProject = {
+      kind: "project",
+      id: "p1",
+      name: "Ship: v2",
+      status: "open",
+      todos: [],
+    };
+    expect(renderProject(project, openOnly)).toContain('project: "Ship: v2"');
+  });
+
+  test("stable output across repeated renders of the same input", () => {
+    const project: MdProject = {
+      kind: "project",
+      id: "p1",
+      name: "Stable",
+      status: "open",
+      todos: [
+        { id: "t1", name: "One", status: "open" },
+        { id: "t2", name: "Two", status: "open" },
+      ],
+    };
+    expect(renderProject(project, openOnly)).toBe(renderProject(project, openOnly));
+  });
+});
+
+describe("export_markdown", () => {
+  test("requires exactly one selector", async () => {
+    const { tools } = createMockApp();
+    const result = await callTool(tools.export_markdown.handler, {});
+    expect(isError(result)).toBeTrue();
+    expect(textOf(result)).toBe("Provide exactly one of list, project, area, or id");
+  });
+
+  test("rejects multiple selectors", async () => {
+    const { tools } = createMockApp();
+    const result = await callTool(tools.export_markdown.handler, {
+      list: "today",
+      project: "X",
+    });
+    expect(isError(result)).toBeTrue();
+    expect(textOf(result)).toBe("Provide exactly one of list, project, area, or id");
+  });
+
+  test("renders a project by name and filters completed todos by default", async () => {
+    const { tools, jxaCalls } = createMockApp({
+      jxa: async () =>
+        JSON.stringify({
+          kind: "project",
+          id: "p1",
+          name: "Launch",
+          status: "open",
+          area: "Engineering",
+          dueDate: null,
+          tags: [],
+          notes: "",
+          todos: [
+            { kind: "todo", id: "t1", name: "Open item", status: "open" },
+            { kind: "todo", id: "t2", name: "Done item", status: "completed" },
+          ],
+        }),
+    });
+
+    const result = await callTool(tools.export_markdown.handler, { project: "Launch" });
+    const text = textOf(result);
+    expect(text).toContain("## Launch");
+    expect(text).toContain("- [ ] Open item");
+    expect(text).not.toContain("Done item");
+    expect(jxaCalls[0]?.body).toContain("app.projects.byName(P.n)");
+    expect(jxaCalls[0]?.body).toContain("toDoChecklistItems");
+  });
+
+  test("renders a project by id with include_completed", async () => {
+    const { tools } = createMockApp({
+      jxa: async () =>
+        JSON.stringify({
+          kind: "project",
+          id: "p1",
+          name: "Launch",
+          status: "open",
+          todos: [
+            { kind: "todo", id: "t1", name: "Open", status: "open" },
+            { kind: "todo", id: "t2", name: "Done", status: "completed" },
+            { kind: "todo", id: "t3", name: "Killed", status: "canceled" },
+          ],
+        }),
+    });
+
+    const result = await callTool(tools.export_markdown.handler, {
+      id: "p1",
+      include_completed: true,
+    });
+    const text = textOf(result);
+    expect(text).toContain("- [ ] Open");
+    expect(text).toContain("- [x] Done");
+    expect(text).toContain("- [x] Killed (canceled)");
+  });
+
+  test("renders a bare todo when id resolves to a todo", async () => {
+    const { tools } = createMockApp({
+      jxa: async () =>
+        JSON.stringify({
+          kind: "todo",
+          id: "t1",
+          name: "Standalone",
+          status: "open",
+          checklistItems: [{ name: "sub", done: false }],
+        }),
+    });
+
+    const result = await callTool(tools.export_markdown.handler, { id: "t1" });
+    const text = textOf(result);
+    expect(text).toContain("- [ ] Standalone");
+    expect(text).toContain("    - [ ] sub");
+  });
+
+  test("renders an area with shallow project summaries", async () => {
+    const { tools, jxaCalls } = createMockApp({
+      jxa: async () =>
+        JSON.stringify([
+          { kind: "project", id: "p1", name: "Alpha", status: "open", todoCount: 4 },
+          { kind: "project", id: "p2", name: "Beta", status: "open", todoCount: 1 },
+        ]),
+    });
+
+    const result = await callTool(tools.export_markdown.handler, { area: "Engineering" });
+    const text = textOf(result);
+    expect(text).toContain("# Engineering");
+    expect(text).toContain('project: "Alpha"');
+    expect(text).toContain('project: "Beta"');
+    expect(text).toContain("*4 open todos*");
+    expect(text).toContain("*1 open todo*");
+    expect(jxaCalls[0]?.body).toContain("p.area().name() === target");
+  });
+
+  test("renders a built-in list via fast-read when available", async () => {
+    const { tools, jxaCalls } = createMockApp({
+      fastListRead: async (list) => {
+        expect(list).toBe("logbook");
+        return JSON.stringify([
+          { kind: "todo", id: "t1", name: "Finished", status: "completed" },
+        ]);
+      },
+    });
+
+    const result = await callTool(tools.export_markdown.handler, {
+      list: "logbook",
+      include_completed: true,
+    });
+    const text = textOf(result);
+    expect(text).toContain("# Logbook");
+    expect(text).toContain("- [x] Finished");
+    expect(jxaCalls).toHaveLength(0);
+  });
+
+  test("renders an empty list with *(empty)*", async () => {
+    const { tools } = createMockApp({
+      jxa: async () => "[]",
+    });
+
+    const result = await callTool(tools.export_markdown.handler, { list: "inbox" });
+    expect(textOf(result)).toBe("# Inbox\n\n*(empty)*\n");
+  });
+
+  test("surfaces errors from jxa", async () => {
+    const { tools } = createMockApp({
+      jxa: async () => {
+        throw new Error("not found");
+      },
+    });
+
+    const result = await callTool(tools.export_markdown.handler, { project: "Missing" });
+    expect(isError(result)).toBeTrue();
+    expect(textOf(result)).toBe("not found");
+  });
+});
+
+describe("stats", () => {
+  test("defaults to today-today window and returns mocked counts", async () => {
+    const today = new Date();
+    const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+
+    const { tools, statsCalls } = createMockApp({
+      statsQuery: async (window) => ({
+        window,
+        completed: 3,
+        canceled: 0,
+        created: 5,
+        overdue: 2,
+        inbox: 4,
+        today: 6,
+      }),
+    });
+
+    const result = await callTool(tools.stats.handler, {});
+    const parsed = JSON.parse(textOf(result)!) as StatsResult;
+    expect(parsed.window).toEqual({ since: todayIso, until: todayIso });
+    expect(parsed.completed).toBe(3);
+    expect(parsed.canceled).toBe(0);
+    expect(parsed.created).toBe(5);
+    expect(parsed.overdue).toBe(2);
+    expect(parsed.inbox).toBe(4);
+    expect(parsed.today).toBe(6);
+    expect(statsCalls).toHaveLength(1);
+    expect(statsCalls[0]?.window).toEqual({ since: todayIso, until: todayIso });
+  });
+
+  test("passes an explicit window through", async () => {
+    const { tools, statsCalls } = createMockApp({
+      statsQuery: async (window) => ({
+        window,
+        completed: 12,
+        canceled: 1,
+        created: 20,
+        overdue: 0,
+        inbox: 2,
+        today: 3,
+      }),
+    });
+
+    const result = await callTool(tools.stats.handler, {
+      since: "2026-04-16",
+      until: "2026-04-22",
+    });
+    const parsed = JSON.parse(textOf(result)!) as StatsResult;
+    expect(parsed.window).toEqual({ since: "2026-04-16", until: "2026-04-22" });
+    expect(parsed.completed).toBe(12);
+    expect(statsCalls[0]?.window).toEqual({ since: "2026-04-16", until: "2026-04-22" });
+  });
+
+  test("defaults since to until when only until is provided", async () => {
+    const { tools, statsCalls } = createMockApp({
+      statsQuery: async (window) => ({
+        window,
+        completed: 0,
+        canceled: 0,
+        created: 0,
+        overdue: 0,
+        inbox: 0,
+        today: 0,
+      }),
+    });
+
+    await callTool(tools.stats.handler, { until: "2026-04-20" });
+    expect(statsCalls[0]?.window).toEqual({ since: "2026-04-20", until: "2026-04-20" });
+  });
+
+  test("rejects until < since", async () => {
+    const { tools, statsCalls } = createMockApp();
+    const result = await callTool(tools.stats.handler, {
+      since: "2026-04-22",
+      until: "2026-04-16",
+    });
+    expect(isError(result)).toBeTrue();
+    expect(textOf(result)).toBe("until must be >= since");
+    expect(statsCalls).toHaveLength(0);
+  });
+
+  test("fails explicitly when the database is unavailable", async () => {
+    const { tools } = createMockApp({
+      statsQuery: async () => null,
+    });
+
+    const result = await callTool(tools.stats.handler, {});
+    expect(isError(result)).toBeTrue();
+    expect(textOf(result)).toContain("stats requires THINGS_FAST_READS=1");
+    expect(textOf(result)).toContain("doctor");
+  });
+
+  test("allows null inbox/today when JXA is unavailable", async () => {
+    const { tools } = createMockApp({
+      statsQuery: async (window) => ({
+        window,
+        completed: 1,
+        canceled: 0,
+        created: 2,
+        overdue: 1,
+        inbox: null,
+        today: null,
+      }),
+    });
+
+    const result = await callTool(tools.stats.handler, {});
+    const parsed = JSON.parse(textOf(result)!) as StatsResult;
+    expect(parsed.inbox).toBeNull();
+    expect(parsed.today).toBeNull();
+    expect(parsed.completed).toBe(1);
+  });
+
+  test("surfaces unexpected statsQuery errors", async () => {
+    const { tools } = createMockApp({
+      statsQuery: async () => {
+        throw new Error("db locked");
+      },
+    });
+
+    const result = await callTool(tools.stats.handler, {});
+    expect(isError(result)).toBeTrue();
+    expect(textOf(result)).toBe("db locked");
   });
 });

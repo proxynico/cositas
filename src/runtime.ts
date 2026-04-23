@@ -16,6 +16,8 @@ import {
   isSandboxAutomationError,
   normalizeThingsJson,
   requireToken,
+  StatsResult,
+  StatsWindow,
   ThingsRuntime,
 } from "./shared";
 
@@ -163,7 +165,11 @@ delay(0.5);`,
     },
 
     async fastListRead(list, options = {}) {
-      if (!THINGS_FAST_READS || (list !== "logbook" && list !== "trash")) {
+      // SQL-first fast-read paths. Things JXA cannot reliably enumerate the
+      // built-in Inbox and Today lists (list.toDos() returns empty), so we
+      // resolve IDs from SQLite and hydrate via JXA by-id.
+      const supported = list === "logbook" || list === "trash" || list === "today" || list === "inbox";
+      if (!THINGS_FAST_READS || !supported) {
         return null;
       }
 
@@ -184,8 +190,22 @@ delay(0.5);`,
           where.push("trashed = 0");
           where.push("status in (2, 3)");
           orderBy = "stopDate desc, userModificationDate desc";
-        } else {
+        } else if (list === "trash") {
           where.push("trashed = 1");
+        } else if (list === "today") {
+          where.push("trashed = 0");
+          where.push("status = 0");
+          where.push("todayIndex != 0");
+          orderBy = "todayIndex asc, userModificationDate desc";
+        } else if (list === "inbox") {
+          where.push("trashed = 0");
+          where.push("status = 0");
+          where.push("project is null");
+          where.push("area is null");
+          where.push("heading is null");
+          where.push("start != 2");
+          where.push("todayIndex = 0");
+          orderBy = '"index" asc, userModificationDate desc';
         }
 
         if (options.completed_after) {
@@ -306,6 +326,84 @@ delay(0.5);`,
 
           return (original.get(String(left.id ?? "")) ?? 0) - (original.get(String(right.id ?? "")) ?? 0);
         });
+      } finally {
+        db.close(false);
+      }
+    },
+
+    async statsQuery(window: StatsWindow): Promise<StatsResult | null> {
+      if (!THINGS_FAST_READS) return null;
+
+      if (dbPath === undefined) {
+        dbPath = discoverThingsDbPath();
+      }
+      if (!dbPath) return null;
+
+      const sinceStart = isoDayToUnixStart(window.since);
+      const untilEnd = isoDayToUnixEnd(window.until);
+      const today = new Date();
+      const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+      const todayStart = isoDayToUnixStart(todayIso);
+
+      const db = new Database(dbPath, { readonly: true, create: false });
+      try {
+        const windowRow = db
+          .query(
+            `select
+               coalesce(sum(case when status = 2 and stopDate >= ? and stopDate <= ? then 1 else 0 end), 0) as completed,
+               coalesce(sum(case when status = 3 and stopDate >= ? and stopDate <= ? then 1 else 0 end), 0) as canceled,
+               coalesce(sum(case when creationDate >= ? and creationDate <= ? then 1 else 0 end), 0) as created
+             from TMTask
+             where trashed = 0 and type in (0, 1)`,
+          )
+          .get(sinceStart, untilEnd, sinceStart, untilEnd, sinceStart, untilEnd) as {
+          completed: number;
+          canceled: number;
+          created: number;
+        };
+
+        // Snapshot counts. Schema notes:
+        //   overdue  = open todos with deadline strictly before start-of-today.
+        //   today    = open todos in Today list — identified by nonzero todayIndex.
+        //              Things JXA can't enumerate built-in list items reliably, so
+        //              SQL is the authoritative path.
+        //   inbox    = open todos with no parent (project/area/heading), not in
+        //              Someday (start != 2), and not pulled into Today.
+        const overdueRow = db
+          .query(
+            `select count(*) as n from TMTask
+             where trashed = 0 and type = 0 and status = 0
+               and deadline is not null and deadline < ?`,
+          )
+          .get(todayStart) as { n: number } | null;
+
+        const todayRow = db
+          .query(
+            `select count(*) as n from TMTask
+             where trashed = 0 and type = 0 and status = 0
+               and todayIndex != 0`,
+          )
+          .get() as { n: number } | null;
+
+        const inboxRow = db
+          .query(
+            `select count(*) as n from TMTask
+             where trashed = 0 and type = 0 and status = 0
+               and project is null and area is null and heading is null
+               and start != 2
+               and todayIndex = 0`,
+          )
+          .get() as { n: number } | null;
+
+        return {
+          window,
+          completed: Number(windowRow?.completed ?? 0),
+          canceled: Number(windowRow?.canceled ?? 0),
+          created: Number(windowRow?.created ?? 0),
+          overdue: Number(overdueRow?.n ?? 0),
+          inbox: Number(inboxRow?.n ?? 0),
+          today: Number(todayRow?.n ?? 0),
+        };
       } finally {
         db.close(false);
       }

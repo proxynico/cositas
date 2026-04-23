@@ -13,6 +13,18 @@ export type RuntimeInspection = {
   dbPath: string | null;
 };
 
+export type StatsWindow = { since: string; until: string };
+
+export type StatsResult = {
+  window: StatsWindow;
+  completed: number;
+  canceled: number;
+  created: number;
+  overdue: number;
+  inbox: number | null;
+  today: number | null;
+};
+
 export type ThingsRuntime = {
   jxa(body: string, args?: Record<string, unknown>): Promise<string>;
   quietUrl(path: string, params: Record<string, string | undefined>): Promise<void>;
@@ -27,6 +39,7 @@ export type ThingsRuntime = {
     },
   ): Promise<string | null>;
   sortListItems(list: string, items: Array<Record<string, unknown>>): Array<Record<string, unknown>>;
+  statsQuery(window: StatsWindow): Promise<StatsResult | null>;
   inspect(): RuntimeInspection;
   token: string;
 };

@@ -11,12 +11,22 @@ import {
   normalizeThingsValue,
   ok,
   requireToken,
+  StatsWindow,
   ThingsRuntime,
   updateDeadlineSchema,
   updateWhenSchema,
   usesSpecialWhen,
   whenSchema,
 } from "./shared";
+import {
+  MdItem,
+  MdProject,
+  MdRenderOptions,
+  renderArea,
+  renderItem,
+  renderList,
+  renderProject,
+} from "./markdown";
 import { verifyThingsAccess } from "./runtime";
 
 async function readItemJson(runtime: ThingsRuntime, id: string): Promise<string> {
@@ -40,6 +50,117 @@ async function readItemJson(runtime: ThingsRuntime, id: string): Promise<string>
       { id },
     ),
   );
+}
+
+// For export_markdown: same as readItemJson but populates checklistItems
+// on every child todo of a project (readItemJson only does it for standalone todos).
+async function readItemForExport(runtime: ThingsRuntime, id: string): Promise<string> {
+  return normalizeThingsJson(
+    await runtime.jxa(
+      `var withChecklist = function(t) {
+  var r = todoOf(t);
+  try {
+    r.checklistItems = t.toDoChecklistItems().map(function(c) {
+      return {name: c.name(), done: c.status() === "completed"};
+    });
+  } catch(e) {}
+  return r;
+};
+try {
+  var t = app.toDos.byId(P.id); t.id();
+  return JSON.stringify(withChecklist(t));
+} catch(e) {
+  var p = app.projects.byId(P.id); p.id();
+  var r = projectOf(p);
+  r.todos = p.toDos().map(withChecklist);
+  return JSON.stringify(r);
+}`,
+      { id },
+    ),
+  );
+}
+
+async function readProjectForExport(runtime: ThingsRuntime, name: string): Promise<string> {
+  return normalizeThingsJson(
+    await runtime.jxa(
+      `var withChecklist = function(t) {
+  var r = todoOf(t);
+  try {
+    r.checklistItems = t.toDoChecklistItems().map(function(c) {
+      return {name: c.name(), done: c.status() === "completed"};
+    });
+  } catch(e) {}
+  return r;
+};
+var p = app.projects.byName(P.n); p.id();
+var r = projectOf(p);
+r.todos = p.toDos().map(withChecklist);
+return JSON.stringify(r);`,
+      { n: name },
+    ),
+  );
+}
+
+async function readAreaProjectsJson(runtime: ThingsRuntime, name: string): Promise<string> {
+  return normalizeThingsJson(
+    await runtime.jxa(
+      `var target = P.n;
+var projs = app.projects().filter(function(p) {
+  if (p.status() !== "open") return false;
+  try { return p.area().name() === target; }
+  catch(e) { return false; }
+});
+return JSON.stringify(projs.map(projectOf));`,
+      { n: name },
+    ),
+  );
+}
+
+async function readBuiltinListJson(
+  runtime: ThingsRuntime,
+  list: string,
+  options: {
+    limit?: number;
+    offset?: number;
+    completed_after?: string;
+    completed_before?: string;
+  },
+): Promise<MdItem[]> {
+  const fast = await runtime.fastListRead(list, options);
+  if (fast != null) {
+    return JSON.parse(fast) as MdItem[];
+  }
+
+  const mixed = await runtime.jxa(
+    `var list = app.lists.byName(P.n);
+var todos = list.toDos().map(todoOf);
+var projects = [];
+try { projects = list.projects().map(projectOf); } catch(e) {}
+var items = todos.concat(projects);
+if (P.completedAfter || P.completedBefore) {
+  items = items.filter(function(item) {
+    var stamp = item.completionDate || item.cancellationDate;
+    if (!stamp) return false;
+    var value = new Date(stamp);
+    if (P.completedAfter && value < new Date(P.completedAfter + "T00:00:00")) return false;
+    if (P.completedBefore && value > new Date(P.completedBefore + "T23:59:59")) return false;
+    return true;
+  });
+}
+return JSON.stringify(items);`,
+    {
+      n: LIST_NAMES[list]!,
+      completedAfter: options.completed_after ?? null,
+      completedBefore: options.completed_before ?? null,
+    },
+  );
+
+  const sorted = runtime.sortListItems(
+    list,
+    JSON.parse(normalizeThingsJson(mixed)) as Array<Record<string, unknown>>,
+  ) as MdItem[];
+  const start = options.offset ?? 0;
+  return options.limit != null ? sorted.slice(start, start + options.limit) : sorted.slice(start);
 }
 
 async function applyQuietUpdate(
@@ -335,6 +456,97 @@ return JSON.stringify(results.map(todoOf));`,
           ),
           ),
         );
+      } catch (error) {
+        return fail(errmsg(error));
+      }
+    },
+  );
+
+  tools.export_markdown = server.tool(
+    "export_markdown",
+    "Export Things items as clean markdown for pasting into notes. Returns raw markdown text, not JSON.",
+    {
+      list: z
+        .enum(["inbox", "today", "anytime", "upcoming", "someday", "logbook", "trash"])
+        .optional()
+        .describe("Built-in list to render as markdown"),
+      project: z.string().optional().describe("Project name — renders its todos"),
+      area: z.string().optional().describe("Area name — renders shallow per-project summaries"),
+      id: z.string().optional().describe("Todo or project ID — renders detail"),
+      include_notes: z.boolean().optional().describe("Include notes in the output (default true)"),
+      include_completed: z.boolean().optional().describe("Include completed and canceled items (default false)"),
+      limit: z.number().int().nonnegative().optional().describe("Max items to return for list reads"),
+      offset: z.number().int().nonnegative().optional().describe("Items to skip before returning results for list reads"),
+      completed_after: deadlineSchema.optional().describe("For list reads: only include items completed/canceled on or after yyyy-mm-dd"),
+      completed_before: deadlineSchema.optional().describe("For list reads: only include items completed/canceled on or before yyyy-mm-dd"),
+    },
+    async ({ list, project, area, id, include_notes, include_completed, limit, offset, completed_after, completed_before }) => {
+      const selectors = [list, project, area, id].filter((value) => value != null);
+      if (selectors.length !== 1) {
+        return fail("Provide exactly one of list, project, area, or id");
+      }
+
+      const opts: MdRenderOptions = {
+        includeNotes: include_notes ?? true,
+        includeCompleted: include_completed ?? false,
+      };
+
+      try {
+        if (id) {
+          const item = JSON.parse(await readItemForExport(runtime, id)) as MdItem;
+          return ok(renderItem(item, opts));
+        }
+
+        if (project) {
+          const proj = JSON.parse(await readProjectForExport(runtime, project)) as MdProject;
+          return ok(renderProject(proj, opts));
+        }
+
+        if (area) {
+          const projects = JSON.parse(await readAreaProjectsJson(runtime, area)) as MdProject[];
+          return ok(renderArea(area, projects, opts));
+        }
+
+        const items = await readBuiltinListJson(runtime, list!, {
+          limit,
+          offset,
+          completed_after,
+          completed_before,
+        });
+        return ok(renderList(list!, items, opts));
+      } catch (error) {
+        return fail(errmsg(error));
+      }
+    },
+  );
+
+  tools.stats = server.tool(
+    "stats",
+    "Return Things counts: windowed (completed, canceled, created) and snapshot (overdue, inbox, today). SQL-first; requires THINGS_FAST_READS=1 and a reachable Things database. Windows use local-time calendar days.",
+    {
+      since: deadlineSchema.optional().describe("yyyy-mm-dd (default: until)"),
+      until: deadlineSchema.optional().describe("yyyy-mm-dd (default: today, local time)"),
+    },
+    async ({ since, until }) => {
+      const today = new Date();
+      const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+      const windowUntil = until ?? todayIso;
+      const windowSince = since ?? windowUntil;
+
+      if (windowSince > windowUntil) {
+        return fail("until must be >= since");
+      }
+
+      const window: StatsWindow = { since: windowSince, until: windowUntil };
+
+      try {
+        const result = await runtime.statsQuery(window);
+        if (result == null) {
+          return fail(
+            "stats requires THINGS_FAST_READS=1 and a reachable Things database. Run 'doctor' for diagnostics.",
+          );
+        }
+        return ok(JSON.stringify(result));
       } catch (error) {
         return fail(errmsg(error));
       }
