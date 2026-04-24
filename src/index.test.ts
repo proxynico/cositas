@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
   createRuntime,
   createServer,
@@ -24,6 +25,7 @@ import {
 type Call = {
   body: string;
   args: Record<string, unknown> | undefined;
+  signal?: AbortSignal;
 };
 
 function createMockApp({
@@ -37,9 +39,9 @@ function createMockApp({
   inspect,
 }: {
   token?: string;
-  jxa?: (body: string, args?: Record<string, unknown>) => Promise<string> | string;
-  quietUrl?: (path: string, params: Record<string, string | undefined>) => Promise<void> | void;
-  quietJson?: (operations: Array<Record<string, unknown>>, reveal?: boolean) => Promise<void> | void;
+  jxa?: (body: string, args?: Record<string, unknown>, options?: { signal?: AbortSignal }) => Promise<string> | string;
+  quietUrl?: (path: string, params: Record<string, string | undefined>, options?: { signal?: AbortSignal }) => Promise<void> | void;
+  quietJson?: (operations: Array<Record<string, unknown>>, reveal?: boolean, options?: { signal?: AbortSignal }) => Promise<void> | void;
   fastListRead?: (
     list: string,
     options?: {
@@ -48,6 +50,7 @@ function createMockApp({
       completed_after?: string;
       completed_before?: string;
     },
+    callOptions?: { signal?: AbortSignal },
   ) => Promise<string | null> | string | null;
   sortListItems?: (list: string, items: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
   statsQuery?: (window: StatsWindow) => Promise<StatsResult | null> | StatsResult | null;
@@ -60,21 +63,21 @@ function createMockApp({
 
   const runtime: ThingsRuntime = {
     token,
-    async jxa(body, args) {
-      jxaCalls.push({ body, args });
+    async jxa(body, args, options) {
+      jxaCalls.push({ body, args, signal: options?.signal });
       if (!jxa) return "[]";
-      return await jxa(body, args);
+      return await jxa(body, args, options);
     },
-    async quietUrl(path, params) {
+    async quietUrl(path, params, options) {
       quietCalls.push({ path, params });
-      await quietUrl?.(path, params);
+      await quietUrl?.(path, params, options);
     },
-    async quietJson(operations, reveal) {
+    async quietJson(operations, reveal, options) {
       quietJsonCalls.push({ operations, reveal });
-      await quietJson?.(operations, reveal);
+      await quietJson?.(operations, reveal, options);
     },
-    async fastListRead(list, options) {
-      return (await fastListRead?.(list, options)) ?? null;
+    async fastListRead(list, options, callOptions) {
+      return (await fastListRead?.(list, options, callOptions)) ?? null;
     },
     sortListItems(list, items) {
       return sortListItems ? sortListItems(list, items) : items;
@@ -100,8 +103,8 @@ function createMockApp({
   return { tools, jxaCalls, quietCalls, quietJsonCalls, statsCalls };
 }
 
-async function callTool(tool: unknown, args: Record<string, unknown>) {
-  return await (tool as (args: Record<string, unknown>, extra: unknown) => Promise<unknown>)(args, {});
+async function callTool(tool: unknown, args: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+  return await (tool as (args: Record<string, unknown>, extra: unknown) => Promise<unknown>)(args, extra);
 }
 
 function textOf(result: unknown) {
@@ -121,17 +124,39 @@ describe("runtime", () => {
     expect(errmsg("plain")).toBe("plain");
   });
 
+  test("stats day windows use local calendar boundaries", () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        [
+          'import { isoDayToUnixStart, isoDayToUnixEnd } from "./src/shared.ts";',
+          'console.log(JSON.stringify([isoDayToUnixStart("2026-04-23"), isoDayToUnixEnd("2026-04-23")]));',
+        ].join(" "),
+      ],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, TZ: "Asia/Hong_Kong" },
+        encoding: "utf8",
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual([1776873600, 1776959999]);
+  });
+
   test("jxa builds the osascript invocation", async () => {
-    const calls: Array<{ file: string; args: string[] }> = [];
+    const calls: Array<{ file: string; args: string[]; options?: { signal?: AbortSignal } }> = [];
+    const controller = new AbortController();
     const runtime = createRuntime({
       token: "token",
-      execFn: async (file, args) => {
-        calls.push({ file, args });
+      execFn: async (file, args, options) => {
+        calls.push({ file, args, options });
         return { stdout: "  ok  " };
       },
     });
 
-    const result = await runtime.jxa("return JSON.stringify(P);", { hello: "world" });
+    const result = await runtime.jxa("return JSON.stringify(P);", { hello: "world" }, { signal: controller.signal });
     expect(result).toBe("ok");
     expect(calls).toHaveLength(1);
     expect(calls[0]?.file).toBe("osascript");
@@ -139,6 +164,7 @@ describe("runtime", () => {
     expect(calls[0]?.args[1]).toBe("JavaScript");
     expect(calls[0]?.args[3]).toContain('var app = Application("/Applications/Things3.app");');
     expect(calls[0]?.args[4]).toBe(JSON.stringify({ hello: "world" }));
+    expect(calls[0]?.options?.signal).toBe(controller.signal);
   });
 
   test("quietUrl encodes params and keeps Things in the background", async () => {
@@ -297,12 +323,14 @@ describe("read", () => {
     const { tools, jxaCalls } = createMockApp({
       jxa: async () => '{"id":"1"}',
     });
+    const controller = new AbortController();
 
-    const result = await callTool(tools.read.handler, { id: "1" });
+    const result = await callTool(tools.read.handler, { id: "1" }, { signal: controller.signal });
     expect(textOf(result)).toBe('{"id":"1"}');
     expect(jxaCalls).toHaveLength(1);
     expect(jxaCalls[0]?.body).toContain("toDoChecklistItems");
     expect(jxaCalls[0]?.args).toEqual({ id: "1" });
+    expect(jxaCalls[0]?.signal).toBe(controller.signal);
   });
 
   test("maps built-in list names", async () => {
@@ -433,6 +461,18 @@ describe("read", () => {
 
     expect(seen).toEqual(["today", "inbox"]);
     expect(jxaCalls).toHaveLength(0);
+  });
+
+  test("defaults built-in list reads to a bounded page", async () => {
+    const { tools } = createMockApp({
+      fastListRead: async (_list, options) => {
+        expect(options?.limit).toBe(100);
+        expect(options?.offset).toBe(0);
+        return "[]";
+      },
+    });
+
+    await callTool(tools.read.handler, { list: "today" });
   });
 
   test("lists open projects, areas, and tags", async () => {
@@ -685,9 +725,20 @@ describe("search", () => {
     });
 
     await callTool(tools.search.handler, { query: "ship", tag: "ops" });
-    expect(jxaCalls[0]?.args).toEqual({ q: "ship", t: "ops" });
+    expect(jxaCalls[0]?.args).toEqual({ q: "ship", t: "ops", limit: 100, offset: 0 });
     expect(jxaCalls[0]?.body).toContain('app.toDos.whose({name: {_contains: P.q}})()');
     expect(jxaCalls[0]?.body).toContain("return tagsOf(t).some(function(tagName)");
+    expect(jxaCalls[0]?.body).toContain("results.slice(start, start + P.limit)");
+  });
+
+  test("allows search callers to page within bounded limits", async () => {
+    const { tools, jxaCalls } = createMockApp({
+      jxa: async () => "[]",
+    });
+
+    await callTool(tools.search.handler, { query: "ship", limit: 25, offset: 50 });
+    expect(jxaCalls[0]?.args).toEqual({ q: "ship", t: null, limit: 25, offset: 50 });
+    expect(() => tools.search.inputSchema?.parse({ query: "ship", limit: 501 })).toThrow();
   });
 
   test("uses shared tag fallback logic for tag-only searches", async () => {
@@ -717,6 +768,7 @@ describe("add_todo", () => {
     const { tools } = createMockApp();
     expect(() => tools.add_todo.inputSchema?.parse({ title: "x", when: "later" })).toThrow();
     expect(() => tools.add_todo.inputSchema?.parse({ title: "x", deadline: "2026-4-1" })).toThrow();
+    expect(() => tools.add_todo.inputSchema?.parse({ title: "x", deadline: "2026-99-99" })).toThrow();
     expect(() => tools.add_todo.inputSchema?.parse({ title: "x", when: "2026-04-01" })).not.toThrow();
   });
 
@@ -1069,6 +1121,28 @@ describe("bulk_update", () => {
 });
 
 describe("delete and trash", () => {
+  test("marks destructive tools and requires confirmation for empty_trash", async () => {
+    const { tools, jxaCalls } = createMockApp();
+
+    expect(tools.delete.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+    });
+    expect(tools.empty_trash.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    });
+    expect(() => tools.empty_trash.inputSchema?.parse({})).toThrow();
+
+    const result = await callTool(tools.empty_trash.handler, { confirm: false });
+    expect(isError(result)).toBeTrue();
+    expect(textOf(result)).toBe("Set confirm=true to permanently empty Things Trash");
+    expect(jxaCalls).toHaveLength(0);
+  });
+
   test("deletes an item by id", async () => {
     const { tools, jxaCalls } = createMockApp({
       jxa: async () => '{"id":"1","kind":"todo","deleted":true}',
@@ -1084,7 +1158,7 @@ describe("delete and trash", () => {
       jxa: async () => '{"emptied":true}',
     });
 
-    const result = await callTool(tools.empty_trash.handler, {});
+    const result = await callTool(tools.empty_trash.handler, { confirm: true });
     expect(textOf(result)).toBe('{"emptied":true}');
     expect(jxaCalls[0]?.body).toContain("app.emptyTrash()");
   });
@@ -1485,6 +1559,20 @@ describe("export_markdown", () => {
     expect(text).toContain("# Logbook");
     expect(text).toContain("- [x] Finished");
     expect(jxaCalls).toHaveLength(0);
+  });
+
+  test("renders logbook completed items by default", async () => {
+    const { tools } = createMockApp({
+      fastListRead: async () =>
+        JSON.stringify([
+          { kind: "todo", id: "t1", name: "Finished", status: "completed" },
+        ]),
+    });
+
+    const result = await callTool(tools.export_markdown.handler, { list: "logbook" });
+    const text = textOf(result);
+    expect(text).toContain("# Logbook");
+    expect(text).toContain("- [x] Finished");
   });
 
   test("renders an empty list with *(empty)*", async () => {

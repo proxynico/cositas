@@ -43,7 +43,9 @@ export function createServer(runtime: ThingsRuntime = createRuntime()): {
 /* v8 ignore next 4 */
 if (import.meta.main) {
   const runtime = createRuntime();
-  await verifyThingsAccess(runtime);
+  if (process.env.COSITAS_FAIL_FAST === "1") {
+    await verifyThingsAccess(runtime);
+  }
   const transport = new StdioServerTransport();
   const { server } = createServer(runtime);
   await server.connect(transport);

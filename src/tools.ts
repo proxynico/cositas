@@ -11,6 +11,7 @@ import {
   normalizeThingsValue,
   ok,
   requireToken,
+  RuntimeCallOptions,
   StatsWindow,
   ThingsRuntime,
   updateDeadlineSchema,
@@ -29,7 +30,23 @@ import {
 } from "./markdown";
 import { verifyThingsAccess } from "./runtime";
 
-async function readItemJson(runtime: ThingsRuntime, id: string): Promise<string> {
+const TERMINAL_MARKDOWN_LISTS = new Set(["logbook", "trash"]);
+const DEFAULT_RESULT_LIMIT = 100;
+const MAX_RESULT_LIMIT = 500;
+
+const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
+const ADDITIVE_WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const MUTATING_WRITE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
+
+function requestOptions(extra: { signal?: AbortSignal }): RuntimeCallOptions {
+  return { signal: extra.signal };
+}
+
+function defaultLimit(limit: number | undefined): number {
+  return limit ?? DEFAULT_RESULT_LIMIT;
+}
+
+async function readItemJson(runtime: ThingsRuntime, id: string, options: RuntimeCallOptions = {}): Promise<string> {
   return normalizeThingsJson(
     await runtime.jxa(
       `try {
@@ -48,13 +65,14 @@ async function readItemJson(runtime: ThingsRuntime, id: string): Promise<string>
   return JSON.stringify(r);
 }`,
       { id },
+      options,
     ),
   );
 }
 
 // For export_markdown: same as readItemJson but populates checklistItems
 // on every child todo of a project (readItemJson only does it for standalone todos).
-async function readItemForExport(runtime: ThingsRuntime, id: string): Promise<string> {
+async function readItemForExport(runtime: ThingsRuntime, id: string, options: RuntimeCallOptions = {}): Promise<string> {
   return normalizeThingsJson(
     await runtime.jxa(
       `var withChecklist = function(t) {
@@ -76,11 +94,12 @@ try {
   return JSON.stringify(r);
 }`,
       { id },
+      options,
     ),
   );
 }
 
-async function readProjectForExport(runtime: ThingsRuntime, name: string): Promise<string> {
+async function readProjectForExport(runtime: ThingsRuntime, name: string, options: RuntimeCallOptions = {}): Promise<string> {
   return normalizeThingsJson(
     await runtime.jxa(
       `var withChecklist = function(t) {
@@ -97,11 +116,12 @@ var r = projectOf(p);
 r.todos = p.toDos().map(withChecklist);
 return JSON.stringify(r);`,
       { n: name },
+      options,
     ),
   );
 }
 
-async function readAreaProjectsJson(runtime: ThingsRuntime, name: string): Promise<string> {
+async function readAreaProjectsJson(runtime: ThingsRuntime, name: string, options: RuntimeCallOptions = {}): Promise<string> {
   return normalizeThingsJson(
     await runtime.jxa(
       `var target = P.n;
@@ -112,6 +132,7 @@ var projs = app.projects().filter(function(p) {
 });
 return JSON.stringify(projs.map(projectOf));`,
       { n: name },
+      options,
     ),
   );
 }
@@ -125,8 +146,9 @@ async function readBuiltinListJson(
     completed_after?: string;
     completed_before?: string;
   },
+  callOptions: RuntimeCallOptions = {},
 ): Promise<MdItem[]> {
-  const fast = await runtime.fastListRead(list, options);
+  const fast = await runtime.fastListRead(list, options, callOptions);
   if (fast != null) {
     return JSON.parse(fast) as MdItem[];
   }
@@ -153,6 +175,7 @@ return JSON.stringify(items);`,
       completedAfter: options.completed_after ?? null,
       completedBefore: options.completed_before ?? null,
     },
+    callOptions,
   );
 
   const sorted = runtime.sortListItems(
@@ -168,16 +191,17 @@ async function applyQuietUpdate(
   kind: "todo" | "project",
   id: string,
   params: Record<string, string | undefined>,
+  options: RuntimeCallOptions = {},
 ): Promise<void> {
   requireToken(runtime.token);
   await runtime.quietUrl(kind === "project" ? "update-project" : "update", {
     "auth-token": runtime.token,
     id,
     ...params,
-  });
+  }, options);
 }
 
-async function buildDoctorReport(runtime: ThingsRuntime): Promise<string> {
+async function buildDoctorReport(runtime: ThingsRuntime, options: RuntimeCallOptions = {}): Promise<string> {
   const inspection = runtime.inspect();
   const checks: Record<string, Record<string, unknown>> = {
     app_path: {
@@ -197,7 +221,7 @@ async function buildDoctorReport(runtime: ThingsRuntime): Promise<string> {
   let ok = inspection.appPathExists;
 
   try {
-    await verifyThingsAccess(runtime);
+    await verifyThingsAccess(runtime, options);
     checks.things_access = {
       ok: true,
       message: "Things automation is reachable",
@@ -228,7 +252,7 @@ async function buildDoctorReport(runtime: ThingsRuntime): Promise<string> {
     };
   } else {
     try {
-      const fast = await runtime.fastListRead("logbook", { limit: 1, offset: 0 });
+      const fast = await runtime.fastListRead("logbook", { limit: 1, offset: 0 }, options);
       if (fast == null) {
         throw new Error("Fast SQLite reads are not available");
       }
@@ -257,23 +281,28 @@ async function buildDoctorReport(runtime: ThingsRuntime): Promise<string> {
 export function registerTools(server: McpServer, runtime: ThingsRuntime): Record<string, RegisteredTool> {
   const tools: Record<string, RegisteredTool> = {};
 
-  tools.doctor = server.tool(
+  tools.doctor = server.registerTool(
     "doctor",
-    "Run non-mutating health checks for Things app access, auth token setup, and fast-read availability.",
-    {},
-    async () => {
+    {
+      description: "Run non-mutating health checks for Things app access, auth token setup, and fast-read availability.",
+      inputSchema: {},
+      annotations: READ_ONLY,
+    },
+    async (_params, extra) => {
+      const options = requestOptions(extra);
       try {
-        return ok(await buildDoctorReport(runtime));
+        return ok(await buildDoctorReport(runtime, options));
       } catch (error) {
         return fail(errmsg(error));
       }
     },
   );
 
-  tools.read = server.tool(
+  tools.read = server.registerTool(
     "read",
-    "Read from Things 3. Returns JSON with full item details including IDs.",
     {
+      description: "Read from Things 3. Returns JSON with full item details including IDs.",
+      inputSchema: {
       list: z
         .enum([
           "inbox",
@@ -301,16 +330,19 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
         .string()
         .optional()
         .describe("Todo or project ID — returns full detail with checklist/child todos"),
-      limit: z.number().int().nonnegative().optional().describe("Max items to return"),
+      limit: z.number().int().nonnegative().max(MAX_RESULT_LIMIT).optional().describe("Max items to return"),
       offset: z.number().int().nonnegative().optional().describe("Items to skip before returning results"),
       completed_after: deadlineSchema.optional().describe("Only return items completed/canceled on or after yyyy-mm-dd"),
       completed_before: deadlineSchema.optional().describe("Only return items completed/canceled on or before yyyy-mm-dd"),
+      },
+      annotations: READ_ONLY,
     },
-    async ({ list, project, area, id, limit, offset, completed_after, completed_before }) => {
+    async ({ list, project, area, id, limit, offset, completed_after, completed_before }, extra) => {
       const selectors = [list, project, area, id].filter((value) => value != null);
       if (selectors.length !== 1) {
         return fail("Provide exactly one of list, project, area, or id");
       }
+      const options = requestOptions(extra);
 
       try {
         if (list === "projects") {
@@ -320,6 +352,8 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
               `return JSON.stringify(app.projects().filter(function(p){
   return p.status()==="open";
 }).map(projectOf));`,
+                undefined,
+                options,
             ),
             ),
           );
@@ -329,8 +363,10 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
           return ok(
             await runtime.jxa(
               `return JSON.stringify(app.areas().map(function(a){
-  return {id:a.id(), name:a.name()};
+return {id:a.id(), name:a.name()};
 }));`,
+              undefined,
+              options,
             ),
           );
         }
@@ -339,14 +375,16 @@ export function registerTools(server: McpServer, runtime: ThingsRuntime): Record
           return ok(
             await runtime.jxa(
               `return JSON.stringify(app.tags().map(function(t){
-  return {id:t.id(), name:t.name()};
+return {id:t.id(), name:t.name()};
 }));`,
+              undefined,
+              options,
             ),
           );
         }
 
         if (id) {
-          return ok(await readItemJson(runtime, id));
+          return ok(await readItemJson(runtime, id, options));
         }
 
         if (project) {
@@ -362,6 +400,7 @@ return JSON.stringify(applyReadWindow(p.toDos()).map(todoOf));`,
                 completedAfter: completed_after ?? null,
                 completedBefore: completed_before ?? null,
               },
+              options,
             ),
             ),
           );
@@ -379,17 +418,20 @@ var projs = app.projects().filter(function(p) {
 });
 return JSON.stringify(projs.map(projectOf));`,
               { n: area },
+              options,
             ),
             ),
           );
         }
 
+        const pageLimit = defaultLimit(limit);
+        const pageOffset = offset ?? 0;
         const fast = await runtime.fastListRead(list!, {
-          limit,
-          offset,
+          limit: pageLimit,
+          offset: pageOffset,
           completed_after,
           completed_before,
-        });
+        }, options);
         if (fast != null) {
           return ok(fast);
         }
@@ -416,14 +458,15 @@ return JSON.stringify(items);`,
             completedAfter: completed_after ?? null,
             completedBefore: completed_before ?? null,
           },
+          options,
         );
 
         const sorted = runtime.sortListItems(
           list!,
           JSON.parse(normalizeThingsJson(mixed)) as Array<Record<string, unknown>>,
         );
-        const start = offset ?? 0;
-        const paged = limit != null ? sorted.slice(start, start + limit) : sorted.slice(start);
+        const start = pageOffset;
+        const paged = sorted.slice(start, start + pageLimit);
         return ok(JSON.stringify(paged));
       } catch (error) {
         return fail(errmsg(error));
@@ -431,15 +474,23 @@ return JSON.stringify(items);`,
     },
   );
 
-  tools.search = server.tool(
+  tools.search = server.registerTool(
     "search",
-    "Search Things 3 open todos by name or tag. Returns JSON.",
     {
+      description: "Search Things 3 open todos by name or tag. Returns JSON.",
+      inputSchema: {
       query: z.string().optional().describe("Text to search in todo names"),
       tag: z.string().optional().describe("Tag name to filter by"),
+      limit: z.number().int().nonnegative().max(MAX_RESULT_LIMIT).optional().describe("Max items to return"),
+      offset: z.number().int().nonnegative().optional().describe("Items to skip before returning results"),
+      },
+      annotations: READ_ONLY,
     },
-    async ({ query, tag }) => {
+    async ({ query, tag, limit, offset }, extra) => {
       if (!query && !tag) return fail("Provide query or tag");
+      const options = requestOptions(extra);
+      const pageLimit = defaultLimit(limit);
+      const pageOffset = offset ?? 0;
       try {
         return ok(
           normalizeThingsJson(
@@ -451,8 +502,11 @@ if (P.t) {
     return tagsOf(t).some(function(tagName) { return tagName === P.t; });
   });
 }
+var start = P.offset || 0;
+results = P.limit == null ? results.slice(start) : results.slice(start, start + P.limit);
 return JSON.stringify(results.map(todoOf));`,
-            { q: query ?? null, t: tag ?? null },
+            { q: query ?? null, t: tag ?? null, limit: pageLimit, offset: pageOffset },
+            options,
           ),
           ),
         );
@@ -462,10 +516,11 @@ return JSON.stringify(results.map(todoOf));`,
     },
   );
 
-  tools.export_markdown = server.tool(
+  tools.export_markdown = server.registerTool(
     "export_markdown",
-    "Export Things items as clean markdown for pasting into notes. Returns raw markdown text, not JSON.",
     {
+      description: "Export Things items as clean markdown for pasting into notes. Returns raw markdown text, not JSON.",
+      inputSchema: {
       list: z
         .enum(["inbox", "today", "anytime", "upcoming", "someday", "logbook", "trash"])
         .optional()
@@ -475,44 +530,47 @@ return JSON.stringify(results.map(todoOf));`,
       id: z.string().optional().describe("Todo or project ID — renders detail"),
       include_notes: z.boolean().optional().describe("Include notes in the output (default true)"),
       include_completed: z.boolean().optional().describe("Include completed and canceled items (default false)"),
-      limit: z.number().int().nonnegative().optional().describe("Max items to return for list reads"),
+      limit: z.number().int().nonnegative().max(MAX_RESULT_LIMIT).optional().describe("Max items to return for list reads"),
       offset: z.number().int().nonnegative().optional().describe("Items to skip before returning results for list reads"),
       completed_after: deadlineSchema.optional().describe("For list reads: only include items completed/canceled on or after yyyy-mm-dd"),
       completed_before: deadlineSchema.optional().describe("For list reads: only include items completed/canceled on or before yyyy-mm-dd"),
+      },
+      annotations: READ_ONLY,
     },
-    async ({ list, project, area, id, include_notes, include_completed, limit, offset, completed_after, completed_before }) => {
+    async ({ list, project, area, id, include_notes, include_completed, limit, offset, completed_after, completed_before }, extra) => {
       const selectors = [list, project, area, id].filter((value) => value != null);
       if (selectors.length !== 1) {
         return fail("Provide exactly one of list, project, area, or id");
       }
+      const options = requestOptions(extra);
 
       const opts: MdRenderOptions = {
         includeNotes: include_notes ?? true,
-        includeCompleted: include_completed ?? false,
+        includeCompleted: include_completed ?? (list != null && TERMINAL_MARKDOWN_LISTS.has(list)),
       };
 
       try {
         if (id) {
-          const item = JSON.parse(await readItemForExport(runtime, id)) as MdItem;
+          const item = JSON.parse(await readItemForExport(runtime, id, options)) as MdItem;
           return ok(renderItem(item, opts));
         }
 
         if (project) {
-          const proj = JSON.parse(await readProjectForExport(runtime, project)) as MdProject;
+          const proj = JSON.parse(await readProjectForExport(runtime, project, options)) as MdProject;
           return ok(renderProject(proj, opts));
         }
 
         if (area) {
-          const projects = JSON.parse(await readAreaProjectsJson(runtime, area)) as MdProject[];
+          const projects = JSON.parse(await readAreaProjectsJson(runtime, area, options)) as MdProject[];
           return ok(renderArea(area, projects, opts));
         }
 
         const items = await readBuiltinListJson(runtime, list!, {
-          limit,
-          offset,
+          limit: defaultLimit(limit),
+          offset: offset ?? 0,
           completed_after,
           completed_before,
-        });
+        }, options);
         return ok(renderList(list!, items, opts));
       } catch (error) {
         return fail(errmsg(error));
@@ -520,14 +578,18 @@ return JSON.stringify(results.map(todoOf));`,
     },
   );
 
-  tools.stats = server.tool(
+  tools.stats = server.registerTool(
     "stats",
-    "Return Things counts: windowed (completed, canceled, created) and snapshot (overdue, inbox, today). SQL-first; requires THINGS_FAST_READS=1 and a reachable Things database. Windows use local-time calendar days.",
     {
+      description: "Return Things counts: windowed (completed, canceled, created) and snapshot (overdue, inbox, today). SQL-first; requires THINGS_FAST_READS=1 and a reachable Things database. Windows use local-time calendar days.",
+      inputSchema: {
       since: deadlineSchema.optional().describe("yyyy-mm-dd (default: until)"),
       until: deadlineSchema.optional().describe("yyyy-mm-dd (default: today, local time)"),
+      },
+      annotations: READ_ONLY,
     },
-    async ({ since, until }) => {
+    async ({ since, until }, extra) => {
+      const options = requestOptions(extra);
       const today = new Date();
       const todayIso = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
       const windowUntil = until ?? todayIso;
@@ -540,7 +602,7 @@ return JSON.stringify(results.map(todoOf));`,
       const window: StatsWindow = { since: windowSince, until: windowUntil };
 
       try {
-        const result = await runtime.statsQuery(window);
+        const result = await runtime.statsQuery(window, options);
         if (result == null) {
           return fail(
             "stats requires THINGS_FAST_READS=1 and a reachable Things database. Run 'doctor' for diagnostics.",
@@ -553,10 +615,11 @@ return JSON.stringify(results.map(todoOf));`,
     },
   );
 
-  tools.add_todo = server.tool(
+  tools.add_todo = server.registerTool(
     "add_todo",
-    "Create a todo in Things 3. Returns the created item with its ID.",
     {
+      description: "Create a todo in Things 3. Returns the created item with its ID.",
+      inputSchema: {
       title: z.string(),
       notes: z.string().optional(),
       when: whenSchema
@@ -566,8 +629,11 @@ return JSON.stringify(results.map(todoOf));`,
       tags: z.array(z.string()).optional(),
       list: z.string().optional().describe("Project name to add the todo to"),
       checklist_items: z.array(z.string()).optional(),
+      },
+      annotations: ADDITIVE_WRITE,
     },
-    async (params) => {
+    async (params, extra) => {
+      const options = requestOptions(extra);
       try {
         const specialWhen = usesSpecialWhen(params.when) ? params.when : undefined;
         const tagsNeedJson = needsJsonTagWrite(params.tags);
@@ -602,6 +668,7 @@ return JSON.stringify({id: todo.id(), name: todo.name(), status: todo.status()})
             ...params,
             tagsNeedJson,
           },
+          options,
         );
 
         const created = JSON.parse(result) as { id: string };
@@ -611,8 +678,8 @@ return JSON.stringify({id: todo.id(), name: todo.name(), status: todo.status()})
           checklist_items: params.checklist_items,
         });
         if (operation) {
-          await runtime.quietJson([operation]);
-          return ok(await readItemJson(runtime, created.id));
+          await runtime.quietJson([operation], undefined, options);
+          return ok(await readItemJson(runtime, created.id, options));
         }
 
         return ok(result);
@@ -622,10 +689,11 @@ return JSON.stringify({id: todo.id(), name: todo.name(), status: todo.status()})
     },
   );
 
-  tools.add_project = server.tool(
+  tools.add_project = server.registerTool(
     "add_project",
-    "Create a project in Things 3 with optional child todos. Returns the created project with ID.",
     {
+      description: "Create a project in Things 3 with optional child todos. Returns the created project with ID.",
+      inputSchema: {
       title: z.string(),
       notes: z.string().optional(),
       when: whenSchema
@@ -635,8 +703,11 @@ return JSON.stringify({id: todo.id(), name: todo.name(), status: todo.status()})
       tags: z.array(z.string()).optional(),
       area: z.string().optional().describe("Area name"),
       todos: z.array(z.string()).optional().describe("Child todo titles"),
+      },
+      annotations: ADDITIVE_WRITE,
     },
-    async (params) => {
+    async (params, extra) => {
+      const options = requestOptions(extra);
       try {
         const specialWhen = usesSpecialWhen(params.when) ? params.when : undefined;
         const tagsNeedJson = needsJsonTagWrite(params.tags);
@@ -677,6 +748,7 @@ return JSON.stringify({id: proj.id(), name: proj.name(), status: proj.status()})
             ...params,
             tagsNeedJson,
           },
+          options,
         );
 
         const created = JSON.parse(result) as { id: string };
@@ -685,8 +757,8 @@ return JSON.stringify({id: proj.id(), name: proj.name(), status: proj.status()})
           tags: tagsNeedJson ? params.tags : undefined,
         });
         if (operation) {
-          await runtime.quietJson([operation]);
-          return ok(await readItemJson(runtime, created.id));
+          await runtime.quietJson([operation], undefined, options);
+          return ok(await readItemJson(runtime, created.id, options));
         }
 
         return ok(result);
@@ -696,10 +768,11 @@ return JSON.stringify({id: proj.id(), name: proj.name(), status: proj.status()})
     },
   );
 
-  tools.update = server.tool(
+  tools.update = server.registerTool(
     "update",
-    "Update a todo or project in Things 3 by ID. Detects item type automatically.",
     {
+      description: "Update a todo or project in Things 3 by ID. Detects item type automatically.",
+      inputSchema: {
       id: z.string().describe("Todo or project ID"),
       title: z.string().optional(),
       notes: z.string().optional().describe("Replace notes (use empty string to clear)"),
@@ -715,8 +788,11 @@ return JSON.stringify({id: proj.id(), name: proj.name(), status: proj.status()})
         .string()
         .optional()
         .describe("Move to project (todos) or area (projects) by name"),
+      },
+      annotations: MUTATING_WRITE,
     },
-    async (params) => {
+    async (params, extra) => {
+      const options = requestOptions(extra);
       try {
         const specialWhen = usesSpecialWhen(params.when) ? params.when : undefined;
         const tagsNeedJson = needsJsonTagWrite(params.tags);
@@ -763,6 +839,7 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
             ...params,
             tagsNeedJson,
           },
+          options,
         );
 
         const parsed = JSON.parse(result) as {
@@ -771,8 +848,8 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
         };
 
         if (needsUrlWhenClear) {
-          await applyQuietUpdate(runtime, parsed.kind, params.id, { when: "" });
-          return ok(await readItemJson(runtime, params.id));
+          await applyQuietUpdate(runtime, parsed.kind, params.id, { when: "" }, options);
+          return ok(await readItemJson(runtime, params.id, options));
         }
 
         const operation = buildJsonUpdateOperation(parsed.kind, params.id, {
@@ -781,8 +858,8 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
           checklist_items: params.checklist_items,
         });
         if (operation) {
-          await runtime.quietJson([operation]);
-          return ok(await readItemJson(runtime, params.id));
+          await runtime.quietJson([operation], undefined, options);
+          return ok(await readItemJson(runtime, params.id, options));
         }
 
         return ok(JSON.stringify(normalizeThingsValue(parsed.item)));
@@ -792,10 +869,11 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
     },
   );
 
-  tools.bulk_update = server.tool(
+  tools.bulk_update = server.registerTool(
     "bulk_update",
-    "Update multiple todos or projects at once. Uses Things JSON updates and requires THINGS_AUTH_TOKEN.",
     {
+      description: "Update multiple todos or projects at once. Uses Things JSON updates and requires THINGS_AUTH_TOKEN.",
+      inputSchema: {
       ids: z.array(z.string()).min(1).describe("Todo or project IDs"),
       title: z.string().optional(),
       notes: z.string().optional().describe("Replace notes"),
@@ -806,8 +884,11 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
       completed: z.boolean().optional(),
       canceled: z.boolean().optional(),
       list: z.string().optional().describe("Move todos to a project/area, or projects to an area"),
+      },
+      annotations: MUTATING_WRITE,
     },
-    async (params) => {
+    async (params, extra) => {
+      const options = requestOptions(extra);
       try {
         requireToken(runtime.token);
         const detail = await runtime.jxa(
@@ -821,6 +902,7 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
   }
 }));`,
           { ids: params.ids },
+          options,
         );
         const items = JSON.parse(detail) as Array<{ id: string; kind: "todo" | "project" }>;
         const operations = items
@@ -841,7 +923,7 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
         if (!operations.length) {
           return fail("Provide at least one field to update");
         }
-        await runtime.quietJson(operations);
+        await runtime.quietJson(operations, undefined, options);
         return ok(JSON.stringify(items.map((item) => ({ id: item.id, kind: item.kind, updated: true }))));
       } catch (error) {
         return fail(errmsg(error));
@@ -849,13 +931,17 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
     },
   );
 
-  tools.delete = server.tool(
+  tools.delete = server.registerTool(
     "delete",
-    "Move a todo, project, or area to Things Trash.",
     {
+      description: "Move a todo, project, or area to Things Trash.",
+      inputSchema: {
       id: z.string().describe("Todo, project, or area ID"),
+      },
+      annotations: MUTATING_WRITE,
     },
-    async ({ id }) => {
+    async ({ id }, extra) => {
+      const options = requestOptions(extra);
       try {
         const result = await runtime.jxa(
           `try {
@@ -874,6 +960,7 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
   }
 }`,
           { id },
+          options,
         );
         return ok(result);
       } catch (error) {
@@ -882,13 +969,20 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
     },
   );
 
-  tools.empty_trash = server.tool(
+  tools.empty_trash = server.registerTool(
     "empty_trash",
-    "Permanently delete everything currently in Things Trash.",
-    {},
-    async () => {
+    {
+      description: "Permanently delete everything currently in Things Trash.",
+      inputSchema: {
+      confirm: z.boolean().describe("Must be true to permanently empty Things Trash"),
+      },
+      annotations: MUTATING_WRITE,
+    },
+    async ({ confirm }, extra) => {
+      const options = requestOptions(extra);
+      if (!confirm) return fail("Set confirm=true to permanently empty Things Trash");
       try {
-        await runtime.jxa("app.emptyTrash();");
+        await runtime.jxa("app.emptyTrash();", undefined, options);
         return ok('{"emptied":true}');
       } catch (error) {
         return fail(errmsg(error));
@@ -896,10 +990,11 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
     },
   );
 
-  tools.show = server.tool(
+  tools.show = server.registerTool(
     "show",
-    "Navigate Things 3 to a list, project, area, or item. Uses background URL dispatch.",
     {
+      description: "Navigate Things 3 to a list, project, area, or item. Uses background URL dispatch.",
+      inputSchema: {
       id: z
         .string()
         .optional()
@@ -908,14 +1003,17 @@ return JSON.stringify({kind: type, item: type === "todo" ? todoOf(item) : projec
         .string()
         .optional()
         .describe("Project, area, or tag name to navigate to"),
+      },
+      annotations: READ_ONLY,
     },
-    async ({ id, query }) => {
+    async ({ id, query }, extra) => {
       if (!id && !query) return fail("Provide id or query");
+      const options = requestOptions(extra);
       try {
         await runtime.quietUrl("show", {
           id: id ?? undefined,
           query: query ?? undefined,
-        });
+        }, options);
         return ok(`Showing: ${id ?? query}`);
       } catch (error) {
         return fail(errmsg(error));

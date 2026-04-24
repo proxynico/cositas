@@ -60,7 +60,7 @@ export function createRuntime({
       };
     },
 
-    async jxa(body, args = {}) {
+    async jxa(body, args = {}, options = {}) {
       const { stdout } = await execFn("osascript", [
         "-l",
         "JavaScript",
@@ -129,11 +129,11 @@ var projectOf = function(pr) {
 ${body}
 }`,
         JSON.stringify(args),
-      ] as string[]);
+      ] as string[], options);
       return stdout.trim();
     },
 
-    async quietUrl(path, params) {
+    async quietUrl(path, params, options = {}) {
       const qs = Object.entries(params)
         .filter((entry): entry is [string, string] => entry[1] != null)
         .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
@@ -149,10 +149,10 @@ var c = $.NSWorkspaceOpenConfiguration.configuration;
 c.activates = false;
 $.NSWorkspace.sharedWorkspace.openURLConfigurationCompletionHandler(u, c, null);
 delay(0.5);`,
-      ]);
+      ], options);
     },
 
-    async quietJson(operations, reveal = false) {
+    async quietJson(operations, reveal = false, options = {}) {
       const requiresAuth = operations.some((operation) => operation.operation === "update");
       if (requiresAuth) {
         requireToken(token);
@@ -161,10 +161,10 @@ delay(0.5);`,
         "auth-token": requiresAuth ? token : undefined,
         reveal: reveal ? "true" : "false",
         data: JSON.stringify(operations),
-      });
+      }, options);
     },
 
-    async fastListRead(list, options = {}) {
+    async fastListRead(list, options = {}, callOptions = {}) {
       // SQL-first fast-read paths. Things JXA cannot reliably enumerate the
       // built-in Inbox and Today lists (list.toDos() returns empty), so we
       // resolve IDs from SQLite and hydrate via JXA by-id.
@@ -249,6 +249,7 @@ delay(0.5);`,
   }
 }));`,
             { ids: rows.map((row) => row.id) },
+            callOptions,
           ),
         );
       } finally {
@@ -411,12 +412,14 @@ delay(0.5);`,
   };
 }
 
-export async function verifyThingsAccess(runtime: ThingsRuntime): Promise<void> {
+export async function verifyThingsAccess(runtime: ThingsRuntime, options = {}): Promise<void> {
   try {
     await runtime.jxa(
       `return JSON.stringify(app.lists().map(function(list) {
   return list.name();
 }));`,
+      undefined,
+      options,
     );
   } catch (error) {
     if (isSandboxAutomationError(error)) {

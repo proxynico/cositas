@@ -9,14 +9,16 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that gives AI
 | Tool | |
 |------|--|
 | `doctor` | Run a non-mutating health check for app access, auth-token setup, and fast-read availability |
-| `read` | Pull any list, project, area, or item. Built-in lists are ordered before pagination, and terminal dates are normalized. |
-| `search` | Find open todos by name or tag |
+| `read` | Pull any list, project, area, or item. Built-in list reads default to a 100-item page. |
+| `search` | Find open todos by name or tag, with paged output |
 | `add_todo` | Create todos with notes, deadlines, tags, checklists, project placement |
 | `add_project` | Create projects with child todos and area placement |
 | `update` | Change any item by ID — figures out if it's a todo or project on its own |
 | `bulk_update` | Update a pile of items in one shot. If `completed` and `canceled` conflict, `canceled` wins. |
 | `delete` | Trash it |
-| `empty_trash` | Really trash it |
+| `empty_trash` | Permanently empty Things Trash. Requires `confirm: true`. |
+| `export_markdown` | Render lists, projects, areas, or items as clean markdown for notes |
+| `stats` | Count completed, canceled, created, overdue, inbox, and today items |
 | `show` | Point Things at something without yanking it to the foreground |
 
 ## Setup
@@ -29,7 +31,14 @@ cd cositas
 bun install
 ```
 
-Add to your MCP client config:
+Add to Claude Code:
+
+```bash
+claude mcp add-json --scope user cositas \
+  '{"type":"stdio","command":"bun","args":["run","/path/to/cositas/src/index.ts"],"env":{"THINGS_AUTH_TOKEN":"your-token-here"}}'
+```
+
+Or add to a generic MCP client config:
 
 ```json
 {
@@ -55,8 +64,9 @@ If you only need reads, you can omit `THINGS_AUTH_TOKEN`. The server still start
 |----------|----------|-|
 | `THINGS_AUTH_TOKEN` | Only for some writes | Bulk updates, special scheduling (`evening`, `anytime`, `someday`), checklists, tags with commas. Read-only mode works without it. |
 | `THINGS_APP_PATH` | No | If Things isn't where it usually is. Default: `/Applications/Things3.app` |
-| `THINGS_FAST_READS` | No | Set to `0` if you don't want SQLite-accelerated `logbook`/`trash` reads |
+| `THINGS_FAST_READS` | No | Set to `0` if you don't want SQLite-accelerated `today`, `inbox`, `logbook`, `trash`, and `stats` reads |
 | `THINGS_DB_PATH` | No | Override the auto-detected Things database path |
+| `COSITAS_FAIL_FAST` | No | Set to `1` if you want process startup to fail before MCP connects when Things automation is unavailable |
 
 ## Under the hood
 
@@ -68,7 +78,7 @@ If you only need reads, you can omit `THINGS_AUTH_TOKEN`. The server still start
 
 **Item normalization** keeps terminal state fields consistent for clients: completed items expose `completionDate`, canceled items expose `cancellationDate`, and open items do not emit stale terminal timestamps.
 
-**Startup** does a read-only Things access probe before the MCP server connects, so missing automation permission or a bad app path fails fast instead of surfacing on the first tool call.
+**Startup** connects the MCP server first so `doctor` stays available for diagnostics even when automation permissions are broken. Set `COSITAS_FAIL_FAST=1` if you prefer the older fail-before-connect behavior.
 
 **Doctor** gives you the same checks on demand from the MCP side: app path, automation reachability, auth token presence, and whether the SQLite fast-read path is usable. Its top-level `ok` reflects whether the server can actually read Things successfully; missing `THINGS_AUTH_TOKEN` is surfaced as missing write capability rather than a total health failure.
 

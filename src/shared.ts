@@ -4,7 +4,11 @@ export type ExecResult = {
   stdout: string;
 };
 
-export type ExecFn = (file: string, args: string[]) => Promise<ExecResult>;
+export type RuntimeCallOptions = {
+  signal?: AbortSignal;
+};
+
+export type ExecFn = (file: string, args: string[], options?: RuntimeCallOptions) => Promise<ExecResult>;
 
 export type RuntimeInspection = {
   appPath: string;
@@ -26,9 +30,9 @@ export type StatsResult = {
 };
 
 export type ThingsRuntime = {
-  jxa(body: string, args?: Record<string, unknown>): Promise<string>;
-  quietUrl(path: string, params: Record<string, string | undefined>): Promise<void>;
-  quietJson(operations: Array<Record<string, unknown>>, reveal?: boolean): Promise<void>;
+  jxa(body: string, args?: Record<string, unknown>, options?: RuntimeCallOptions): Promise<string>;
+  quietUrl(path: string, params: Record<string, string | undefined>, options?: RuntimeCallOptions): Promise<void>;
+  quietJson(operations: Array<Record<string, unknown>>, reveal?: boolean, options?: RuntimeCallOptions): Promise<void>;
   fastListRead(
     list: string,
     options?: {
@@ -37,9 +41,10 @@ export type ThingsRuntime = {
       completed_after?: string;
       completed_before?: string;
     },
+    callOptions?: RuntimeCallOptions,
   ): Promise<string | null>;
   sortListItems(list: string, items: Array<Record<string, unknown>>): Array<Record<string, unknown>>;
-  statsQuery(window: StatsWindow): Promise<StatsResult | null>;
+  statsQuery(window: StatsWindow, options?: RuntimeCallOptions): Promise<StatsResult | null>;
   inspect(): RuntimeInspection;
   token: string;
 };
@@ -69,25 +74,32 @@ const SANDBOX_FAILURE_MARKERS = [
   "Sandbox restriction",
 ];
 
+function isValidIsoDay(value: string): boolean {
+  if (!ISO_DATE.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number) as [number, number, number];
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day;
+}
+
 export const whenSchema = z
   .string()
-  .refine((value) => BUILTIN_WHEN.includes(value as (typeof BUILTIN_WHEN)[number]) || ISO_DATE.test(value), {
+  .refine((value) => BUILTIN_WHEN.includes(value as (typeof BUILTIN_WHEN)[number]) || isValidIsoDay(value), {
     message: "Use today, tomorrow, evening, anytime, someday, or yyyy-mm-dd",
   });
 
 export const updateWhenSchema = z
   .string()
-  .refine((value) => value === "" || BUILTIN_WHEN.includes(value as (typeof BUILTIN_WHEN)[number]) || ISO_DATE.test(value), {
+  .refine((value) => value === "" || BUILTIN_WHEN.includes(value as (typeof BUILTIN_WHEN)[number]) || isValidIsoDay(value), {
     message: "Use today, tomorrow, evening, anytime, someday, yyyy-mm-dd, or empty string",
   });
 
 export const deadlineSchema = z
   .string()
-  .regex(ISO_DATE, "Use yyyy-mm-dd");
+  .refine(isValidIsoDay, "Use a real yyyy-mm-dd calendar date");
 
 export const updateDeadlineSchema = z
   .string()
-  .refine((value) => value === "" || ISO_DATE.test(value), {
+  .refine((value) => value === "" || isValidIsoDay(value), {
     message: "Use yyyy-mm-dd or empty string",
   });
 
@@ -113,12 +125,19 @@ export const isSandboxAutomationError = (error: unknown): boolean => {
   return SANDBOX_FAILURE_MARKERS.some((marker) => message.includes(marker));
 };
 
+function parseIsoDay(value: string): [number, number, number] {
+  const [year, month, day] = value.split("-").map(Number) as [number, number, number];
+  return [year, month - 1, day];
+}
+
 export function isoDayToUnixStart(value: string): number {
-  return Math.floor(new Date(`${value}T00:00:00Z`).getTime() / 1000);
+  const [year, month, day] = parseIsoDay(value);
+  return Math.floor(new Date(year, month, day, 0, 0, 0).getTime() / 1000);
 }
 
 export function isoDayToUnixEnd(value: string): number {
-  return Math.floor(new Date(`${value}T23:59:59Z`).getTime() / 1000);
+  const [year, month, day] = parseIsoDay(value);
+  return Math.floor(new Date(year, month, day, 23, 59, 59).getTime() / 1000);
 }
 
 export function compareNullableNumber(a: number | null | undefined, b: number | null | undefined): number {

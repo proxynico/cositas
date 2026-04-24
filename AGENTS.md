@@ -33,6 +33,8 @@ Things 3 MCP server for macOS. Background read/write automation via JXA, with Th
 - `delete` and `empty_trash` are destructive MCP tools; `empty_trash` requires `confirm: true`.
 - MCP cancellation is propagated to `osascript` where the runtime can stop work.
 - `doctor` stays available after MCP startup even if Things automation is broken. Set `COSITAS_FAIL_FAST=1` to fail before connect.
+- `logbook` and `trash` can use the local Things SQLite DB to page/filter IDs quickly, then hydrate final item details through JXA.
+- Built-in list reads can include both todos and projects. Mixed ordering uses DB sort keys when available.
 - Exact area reads still use project filtering because `area.projects()` is unreliable in JXA here.
 
 ## Config
